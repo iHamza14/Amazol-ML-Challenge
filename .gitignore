@@ -1,0 +1,42 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+
+# Dataset and Outputs
+dataset/
+output/
+student_resource/output/
+student_resource/dataset/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# Models
+*.json
+*.pkl
+*.model

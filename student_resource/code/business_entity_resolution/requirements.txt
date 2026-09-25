@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+xgboost
+rapidfuzz
+sentence-transformers
+faiss-cpu
+rank_bm25
+tqdm
+torch

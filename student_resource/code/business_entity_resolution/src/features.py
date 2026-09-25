@@ -1,63 +1,50 @@
 import pandas as pd
 import numpy as np
-from rapidfuzz import fuzz, distance
+from rapidfuzz import fuzz
 
 def extract_features(df_s1, df_s2_s3, candidate_pairs):
-    """
-    Extracts features for all given candidate pairs.
-    candidate_pairs is a list of tuples (s1_id, s23_id).
-    """
-    s1_dict = df_s1.set_index('entity_id').to_dict('index')
-    s23_dict = df_s2_s3.set_index('entity_id').to_dict('index')
+    """Memory-efficient batch extraction without dict-of-dicts."""
+    
+    # Create fast lookup arrays
+    s1_df = df_s1.set_index('entity_id')
+    s23_df = df_s2_s3.set_index('entity_id')
+    
+    s1_ids = [p[0] for p in candidate_pairs]
+    s23_ids = [p[1] for p in candidate_pairs]
+    
+    # Extract columns as lists for fast iteration
+    core1 = s1_df.loc[s1_ids, 'name_core'].values
+    core2 = s23_df.loc[s23_ids, 'name_core'].values
+    name1 = s1_df.loc[s1_ids, 'name_norm'].values
+    name2 = s23_df.loc[s23_ids, 'name_norm'].values
+    addr1 = s1_df.loc[s1_ids, 'address_norm'].values
+    addr2 = s23_df.loc[s23_ids, 'address_norm'].values
+    c1 = s1_df.loc[s1_ids, 'country_norm'].values
+    c2 = s23_df.loc[s23_ids, 'country_norm'].values
     
     features = []
     
-    for s1_id, s23_id in candidate_pairs:
-        if s1_id not in s1_dict or s23_id not in s23_dict:
-            continue
-            
-        r1 = s1_dict[s1_id]
-        r2 = s23_dict[s23_id]
-        
-        name1 = r1['name_norm']
-        name2 = r2['name_norm']
-        core1 = r1['name_core']
-        core2 = r2['name_core']
-        addr1 = r1['address_norm']
-        addr2 = r2['address_norm']
-        
+    for i in range(len(candidate_pairs)):
         feat = {
-            's1_id': s1_id,
-            's23_id': s23_id,
+            's1_id': s1_ids[i],
+            's23_id': s23_ids[i],
             
-            # Name features (Core)
-            'name_jaro_winkler': fuzz.jaro_winkler(core1, core2),
-            'name_levenshtein_ratio': fuzz.ratio(core1, core2),
-            'name_token_sort_ratio': fuzz.token_sort_ratio(core1, core2),
-            'name_token_set_ratio': fuzz.token_set_ratio(core1, core2),
+            'name_jaro_winkler': fuzz.jaro_winkler(core1[i], core2[i]),
+            'name_levenshtein_ratio': fuzz.ratio(core1[i], core2[i]),
+            'name_token_sort_ratio': fuzz.token_sort_ratio(core1[i], core2[i]),
+            'full_name_ratio': fuzz.ratio(name1[i], name2[i]),
             
-            # Name features (Full norm)
-            'full_name_ratio': fuzz.ratio(name1, name2),
+            'addr_jaro_winkler': fuzz.jaro_winkler(addr1[i], addr2[i]),
+            'addr_token_set_ratio': fuzz.token_set_ratio(addr1[i], addr2[i]),
             
-            # Address features
-            'addr_jaro_winkler': fuzz.jaro_winkler(addr1, addr2),
-            'addr_token_set_ratio': fuzz.token_set_ratio(addr1, addr2),
-            'addr_token_sort_ratio': fuzz.token_sort_ratio(addr1, addr2),
-            
-            # Structural features
-            'same_country': int(r1['country_norm'] == r2['country_norm']),
-            'is_source_2': int(s23_id.startswith('S2-')),
-            'is_source_3': int(s23_id.startswith('S3-'))
+            'same_country': int(c1[i] == c2[i]),
+            'is_source_2': int(s23_ids[i].startswith('S2-')),
         }
         
-        # Address digit overlap
-        digits1 = set(filter(str.isdigit, addr1.split()))
-        digits2 = set(filter(str.isdigit, addr2.split()))
-        
-        if digits1 and digits2:
-            overlap = len(digits1.intersection(digits2)) / max(len(digits1), len(digits2))
-        else:
-            overlap = 0.0
+        # Fast digit overlap
+        d1 = set(filter(str.isdigit, addr1[i].split()))
+        d2 = set(filter(str.isdigit, addr2[i].split()))
+        overlap = len(d1.intersection(d2)) / max(len(d1), len(d2)) if d1 and d2 else 0.0
         feat['addr_digit_overlap'] = overlap
         
         features.append(feat)

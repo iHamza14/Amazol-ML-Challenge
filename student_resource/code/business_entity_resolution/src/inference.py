@@ -4,25 +4,13 @@ import os
 import argparse
 import logging
 import torch
+import gc
 from collections import defaultdict
 from sentence_transformers import CrossEncoder
 from preprocess import load_data, preprocess_dataframe
 from blocking import generate_candidates
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def save_candidates(candidate_pairs, s1_ids, output_path):
-    logging.info(f"Saving candidates to {output_path}")
-    grouped = defaultdict(list)
-    for s1, s23 in candidate_pairs:
-        grouped[s1].append(s23)
-        
-    with open(output_path, 'w') as f:
-        f.write("source1_entity_id\tcandidate_entity_ids\n")
-        for s1 in s1_ids:
-            cands = grouped.get(s1, [])
-            cands = list(dict.fromkeys(cands))
-            f.write(f"{s1}\t{','.join(cands)}\n")
 
 def save_matches(predictions, s1_ids, output_path):
     logging.info(f"Saving matches to {output_path}")
@@ -40,22 +28,26 @@ def save_matches(predictions, s1_ids, output_path):
 def run_inference(test_dir, output_dir, model_path="deberta_er_model", threshold=0.8):
     os.makedirs(output_dir, exist_ok=True)
     
-    logging.info("Loading test data...")
+    logging.info("Loading and preprocessing test data chunk-by-chunk to save RAM...")
+    
     df_s1 = load_data(os.path.join(test_dir, "test_source1.tsv"))
+    df_s1 = preprocess_dataframe(df_s1)
+    
     df_s2 = load_data(os.path.join(test_dir, "test_source2.tsv"))
+    df_s2 = preprocess_dataframe(df_s2)
+    
     df_s3 = load_data(os.path.join(test_dir, "test_source3.tsv"))
+    df_s3 = preprocess_dataframe(df_s3)
+    
+    logging.info("Concatenating S2 and S3...")
     df_s23 = pd.concat([df_s2, df_s3], ignore_index=True)
     
-    logging.info("Preprocessing...")
-    df_s1 = preprocess_dataframe(df_s1)
-    df_s23 = preprocess_dataframe(df_s23)
+    del df_s2, df_s3
+    gc.collect()
     
     logging.info("Generating candidates (Lexical + Dense)...")
     candidate_pairs = generate_candidates(df_s1, df_s23)
-    
-    cand_path = os.path.join(output_dir, "candidate_pairs.tsv")
     s1_all_ids = df_s1['entity_id'].tolist()
-    save_candidates(candidate_pairs, s1_all_ids, cand_path)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logging.info(f"Loading Fine-Tuned DeBERTa from {model_path} on {device}...")
@@ -77,7 +69,7 @@ def run_inference(test_dir, output_dir, model_path="deberta_er_model", threshold
         
     logging.info("Running Cross-Encoder Inference...")
     preds = model.predict(inference_texts, batch_size=256, show_progress_bar=True)
-    probs = 1 / (1 + np.exp(-preds)) # apply sigmoid
+    probs = 1 / (1 + np.exp(-preds))
     
     predicted_pairs = []
     for i, prob in enumerate(probs):
@@ -93,7 +85,7 @@ if __name__ == "__main__":
     parser.add_argument("--test-dir", default="../../../dataset/test")
     parser.add_argument("--output-dir", default="../../../output")
     parser.add_argument("--model-path", default="deberta_er_model")
-    parser.add_argument("--threshold", type=float, default=0.8, help="Pass optimal threshold from train.py")
+    parser.add_argument("--threshold", type=float, default=0.8)
     args = parser.parse_args()
     
     run_inference(args.test_dir, args.output_dir, args.model_path, args.threshold)

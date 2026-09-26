@@ -6,24 +6,17 @@ import faiss
 from sentence_transformers import SentenceTransformer
 import torch
 import logging
+from tqdm import tqdm
+from sparse_dot_topn import awesome_cossim_topn
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_sparse_top_k(X_s1, X_s23, top_k=15, threshold=0.3):
-    similarity_matrix = X_s1.dot(X_s23.T)
+    matches = awesome_cossim_topn(X_s1, X_s23.T, top_k, threshold, use_threads=True, n_jobs=8)
     candidates = []
-    for i in range(similarity_matrix.shape[0]):
-        row = similarity_matrix.getrow(i)
-        if row.nnz == 0: continue
-        data, indices = row.data, row.indices
-        valid = data >= threshold
-        data, indices = data[valid], indices[valid]
-        if len(data) == 0: continue
-        if len(data) > top_k:
-            top_k_idx = np.argpartition(data, -top_k)[-top_k:]
-            indices = indices[top_k_idx]
-        for j in indices:
-            candidates.append((i, j))
+    nonzeros = matches.nonzero()
+    for row, col in zip(nonzeros[0], nonzeros[1]):
+        candidates.append((row, col))
     return candidates
 
 def generate_candidates(df_s1, df_s2_s3, top_k=15):
@@ -35,7 +28,6 @@ def generate_candidates(df_s1, df_s2_s3, top_k=15):
     df_s2_s3 = df_s2_s3.reset_index(drop=True)
     countries = df_s1['country_norm'].unique()
     
-    # Check GPU availability for dense embeddings
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logging.info(f"Loading BGE-Large Dense Encoder on {device}...")
     embedder = SentenceTransformer('BAAI/bge-large-en-v1.5', device=device)
@@ -77,17 +69,13 @@ def generate_candidates(df_s1, df_s2_s3, top_k=15):
         s1_docs = s1_country.apply(create_doc, axis=1).tolist()
         s23_docs = s23_country.apply(create_doc, axis=1).tolist()
         
-        # Encode (batch_size optimized for GPU)
         logging.info("Encoding S23 corpus...")
         s23_embs = embedder.encode(s23_docs, batch_size=256, normalize_embeddings=True, show_progress_bar=True)
         logging.info("Encoding S1 queries...")
         s1_embs = embedder.encode(s1_docs, batch_size=256, normalize_embeddings=True, show_progress_bar=True)
         
-        # FAISS Index
         dim = s23_embs.shape[1]
-        # Use Inner Product (Cosine Similarity because normalized)
         index = faiss.IndexFlatIP(dim)
-        # If GPU is available, move index to GPU for blazing fast search
         if device == 'cuda':
             res = faiss.StandardGpuResources()
             index = faiss.index_cpu_to_gpu(res, 0, index)
@@ -97,7 +85,7 @@ def generate_candidates(df_s1, df_s2_s3, top_k=15):
         
         for i, s1_local in enumerate(s1_ids):
             for j, s23_idx in enumerate(indices[i]):
-                if scores[i][j] > 0.7:  # Semantic similarity threshold
+                if scores[i][j] > 0.7:  
                     all_candidates.add((s1_local, s23_ids[s23_idx]))
                     
     return list(all_candidates)

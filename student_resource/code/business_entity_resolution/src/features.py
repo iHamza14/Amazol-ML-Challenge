@@ -24,7 +24,8 @@ def extract_features(df_s1, df_s2_s3, candidate_pairs):
     
     features = []
     
-    for i in range(len(candidate_pairs)):
+    from tqdm import tqdm
+    for i in tqdm(range(len(candidate_pairs)), desc="Calculating String Features"):
         feat = {
             's1_id': s1_ids[i],
             's23_id': s23_ids[i],

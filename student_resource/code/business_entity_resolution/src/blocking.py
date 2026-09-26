@@ -16,7 +16,8 @@ def get_sparse_top_k(X_s1, X_s23, top_k=15, threshold=0.4):
     
     candidates = []
     # Iterate through rows and get top K
-    for i in range(similarity_matrix.shape[0]):
+    from tqdm import tqdm
+    for i in tqdm(range(similarity_matrix.shape[0]), desc="Finding Top Matches"):
         row = similarity_matrix.getrow(i)
         if row.nnz == 0:
             continue

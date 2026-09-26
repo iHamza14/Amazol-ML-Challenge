@@ -40,3 +40,21 @@ student_resource/dataset/
 *.json
 *.pkl
 *.model
+
+# SageMaker / AWS
+*.sagemaker
+.sparkmagic/
+core
+
+# Zips and archives
+*.zip
+*.tar.gz
+AmazonML_Upload.zip
+
+# Logs
+*.log
+logs/
+
+# User-specific scripts or temp files
+scratch/
+temp/

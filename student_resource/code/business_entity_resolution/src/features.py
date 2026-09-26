@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, distance
 
 def extract_features(df_s1, df_s2_s3, candidate_pairs):
     """Memory-efficient batch extraction without dict-of-dicts."""
@@ -13,14 +13,14 @@ def extract_features(df_s1, df_s2_s3, candidate_pairs):
     s23_ids = [p[1] for p in candidate_pairs]
     
     # Extract columns as lists for fast iteration
-    core1 = s1_df.loc[s1_ids, 'name_core'].values
-    core2 = s23_df.loc[s23_ids, 'name_core'].values
-    name1 = s1_df.loc[s1_ids, 'name_norm'].values
-    name2 = s23_df.loc[s23_ids, 'name_norm'].values
-    addr1 = s1_df.loc[s1_ids, 'address_norm'].values
-    addr2 = s23_df.loc[s23_ids, 'address_norm'].values
-    c1 = s1_df.loc[s1_ids, 'country_norm'].values
-    c2 = s23_df.loc[s23_ids, 'country_norm'].values
+    core1 = s1_df.loc[s1_ids, 'name_core'].values.astype(str)
+    core2 = s23_df.loc[s23_ids, 'name_core'].values.astype(str)
+    name1 = s1_df.loc[s1_ids, 'name_norm'].values.astype(str)
+    name2 = s23_df.loc[s23_ids, 'name_norm'].values.astype(str)
+    addr1 = s1_df.loc[s1_ids, 'address_norm'].values.astype(str)
+    addr2 = s23_df.loc[s23_ids, 'address_norm'].values.astype(str)
+    c1 = s1_df.loc[s1_ids, 'country_norm'].values.astype(str)
+    c2 = s23_df.loc[s23_ids, 'country_norm'].values.astype(str)
     
     features = []
     
@@ -29,12 +29,13 @@ def extract_features(df_s1, df_s2_s3, candidate_pairs):
             's1_id': s1_ids[i],
             's23_id': s23_ids[i],
             
-            'name_jaro_winkler': fuzz.jaro_winkler(core1[i], core2[i]),
+            # Using JaroWinkler normalized similarity (returns 0-1, so multiply by 100 to match fuzz scale)
+            'name_jaro_winkler': distance.JaroWinkler.normalized_similarity(core1[i], core2[i]) * 100,
             'name_levenshtein_ratio': fuzz.ratio(core1[i], core2[i]),
             'name_token_sort_ratio': fuzz.token_sort_ratio(core1[i], core2[i]),
             'full_name_ratio': fuzz.ratio(name1[i], name2[i]),
             
-            'addr_jaro_winkler': fuzz.jaro_winkler(addr1[i], addr2[i]),
+            'addr_jaro_winkler': distance.JaroWinkler.normalized_similarity(addr1[i], addr2[i]) * 100,
             'addr_token_set_ratio': fuzz.token_set_ratio(addr1[i], addr2[i]),
             
             'same_country': int(c1[i] == c2[i]),

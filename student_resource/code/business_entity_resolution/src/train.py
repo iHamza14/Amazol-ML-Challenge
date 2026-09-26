@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import logging
 import torch
+import gc
 from sentence_transformers import CrossEncoder, InputExample
 from torch.utils.data import DataLoader
 from preprocess import load_data, preprocess_dataframe
@@ -25,8 +26,6 @@ def create_training_labels(candidate_pairs, ground_truth_df):
     return labels
 
 def calculate_f05(y_true, y_pred):
-    # This is pair-level F0.5. To be strict, we'd do macro entity-level, 
-    # but this is fast for threshold sweeping.
     tp = np.sum((y_true == 1) & (y_pred == 1))
     fp = np.sum((y_true == 0) & (y_pred == 1))
     fn = np.sum((y_true == 1) & (y_pred == 0))
@@ -39,21 +38,31 @@ def calculate_f05(y_true, y_pred):
     return (1.25 * precision * recall) / ((0.25 * precision) + recall)
 
 def train_cross_encoder(limit=None):
-    logging.info(f"Loading datasets (limit={limit})...")
+    logging.info(f"Loading and preprocessing datasets chunk-by-chunk to save RAM (limit={limit})...")
+    
+    # Load and preprocess S1
     df_s1 = load_data("../../../dataset/train/train_source1.tsv")
+    if limit: df_s1 = df_s1.head(limit)
+    df_s1 = preprocess_dataframe(df_s1)
+    
+    # Load and preprocess S2
     df_s2 = load_data("../../../dataset/train/train_source2.tsv")
+    if limit: df_s2 = df_s2.head(limit)
+    df_s2 = preprocess_dataframe(df_s2)
+    
+    # Load and preprocess S3
     df_s3 = load_data("../../../dataset/train/train_source3.tsv")
-    if limit:
-        df_s1 = df_s1.head(limit)
-        df_s2 = df_s2.head(limit)
-        df_s3 = df_s3.head(limit)
-        
+    if limit: df_s3 = df_s3.head(limit)
+    df_s3 = preprocess_dataframe(df_s3)
+    
     gt = load_data("../../../dataset/train/train_ground_truth.tsv")
+    
+    logging.info("Concatenating S2 and S3...")
     df_s23 = pd.concat([df_s2, df_s3], ignore_index=True)
     
-    logging.info("Preprocessing...")
-    df_s1 = preprocess_dataframe(df_s1)
-    df_s23 = preprocess_dataframe(df_s23)
+    # Free up memory immediately
+    del df_s2, df_s3
+    gc.collect()
     
     logging.info("Generating candidates (Lexical + Dense)...")
     candidate_pairs = generate_candidates(df_s1, df_s23)
@@ -65,7 +74,6 @@ def train_cross_encoder(limit=None):
     logging.info(f"Generated {len(candidate_pairs)} candidate pairs.")
     labels = create_training_labels(candidate_pairs, gt)
     
-    # Prepare text for CrossEncoder: "[CLS] name1 | addr1 [SEP] name2 | addr2 [SEP]"
     s1_dict = df_s1.set_index('entity_id').to_dict('index')
     s23_dict = df_s23.set_index('entity_id').to_dict('index')
     
@@ -73,7 +81,6 @@ def train_cross_encoder(limit=None):
     val_texts = []
     val_labels = []
     
-    # 80/20 train/val split logic
     split_idx = int(len(candidate_pairs) * 0.8)
     
     for i, (s1_id, s23_id) in enumerate(candidate_pairs):
@@ -106,10 +113,8 @@ def train_cross_encoder(limit=None):
     model.save(model_path)
     logging.info(f"Model saved to {model_path}")
     
-    # --- DYNAMIC THRESHOLD SWEEP ---
     logging.info("Predicting on Validation Set to find optimal F0.5 Threshold...")
     val_preds = model.predict(val_texts, batch_size=128, show_progress_bar=True)
-    # Apply sigmoid if model outputs logits
     val_probs = 1 / (1 + np.exp(-val_preds))
     
     best_t = 0.5
@@ -126,7 +131,6 @@ def train_cross_encoder(limit=None):
     logging.info(f"=====================================")
     logging.info(f"🎯 OPTIMAL THRESHOLD FOUND: {best_t:.3f}")
     logging.info(f"📈 VALIDATION F0.5 SCORE: {best_f05:.4f}")
-    logging.info(f"Use this threshold in inference.py!")
     logging.info(f"=====================================")
 
 if __name__ == "__main__":

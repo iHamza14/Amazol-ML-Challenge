@@ -58,3 +58,8 @@ logs/
 # User-specific scripts or temp files
 scratch/
 temp/
+
+catboost_info/
+models/
+output/
+cache/

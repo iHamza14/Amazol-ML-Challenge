@@ -1,120 +1,133 @@
-import pandas as pd
-import numpy as np
-import pickle
+"""
+Evaluation v2 — vectorised entity-level macro F0.5 (the exact competition metric).
+
+  F0.5 per S1 entity = 1.25*TP / (1.25*TP + 0.25*FN + FP)
+  singleton (no true matches): 1.0 if predicted empty else 0.0
+  macro average over ALL S1 entities of the evaluation set.
+
+Everything works on integer S1 codes (0..n_s1-1) so sweeps over 60+ thresholds on
+millions of candidate pairs take seconds.
+"""
 import logging
-from preprocess import load_data, preprocess_dataframe
-from blocking import generate_candidates
-from features import extract_features
+import numpy as np
+import pandas as pd
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log = logging.getLogger(__name__)
 
-def calculate_f05_macro(predictions_dict, ground_truth_dict, s1_all_ids):
-    f05_scores = []
-    
-    for s1 in s1_all_ids:
-        y_true = ground_truth_dict.get(s1, set())
-        y_pred = predictions_dict.get(s1, set())
-        
-        if len(y_true) == 0:
-            if len(y_pred) == 0:
-                f05_scores.append(1.0)
-            else:
-                f05_scores.append(0.0)
-            continue
-            
-        if len(y_pred) == 0:
-            f05_scores.append(0.0)
-            continue
-            
-        tp = len(y_true.intersection(y_pred))
-        fp = len(y_pred - y_true)
-        fn = len(y_true - y_pred)
-        
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        
-        if precision == 0 and recall == 0:
-            f05_scores.append(0.0)
+
+def f05_from_counts(n_pred, n_true, tp):
+    """Vectorised per-entity F0.5 from count arrays."""
+    n_pred = np.asarray(n_pred, dtype=np.float64)
+    n_true = np.asarray(n_true, dtype=np.float64)
+    tp = np.asarray(tp, dtype=np.float64)
+    fp = n_pred - tp
+    fn = n_true - tp
+    denom = 1.25 * tp + 0.25 * fn + fp
+    with np.errstate(divide='ignore', invalid='ignore'):
+        f = np.where(denom > 0, 1.25 * tp / np.where(denom > 0, denom, 1.0), 0.0)
+    singleton = n_true == 0
+    f = np.where(singleton, np.where(n_pred == 0, 1.0, 0.0), f)
+    return f
+
+
+def macro_f05(pred_s1_code, pred_is_true, n_true_per_s1):
+    """
+    pred_s1_code : int array (one per predicted pair) of S1 codes
+    pred_is_true : bool/int array (pair is a true match)
+    n_true_per_s1: int array of length n_s1 (true match counts, 0 for singletons)
+    """
+    n_s1 = len(n_true_per_s1)
+    n_pred = np.bincount(pred_s1_code, minlength=n_s1)
+    tp = np.bincount(pred_s1_code, weights=pred_is_true.astype(np.float64), minlength=n_s1)
+    return float(f05_from_counts(n_pred, n_true_per_s1, tp).mean())
+
+
+def threshold_sweep(s1_code, prob, label, n_true_per_s1, grid, mask=None, fp_weight=None, pair_mask=None):
+    """
+    Return list of (threshold, macro_f05) for the given entity subset.
+    mask      : boolean over S1 codes selecting the entities to average over (default all).
+    fp_weight : optional per-pair weight applied to FALSE POSITIVES only (e.g. 1.9 for pairs whose S2/S3
+                record is an unmatched distractor, to mimic the test pool's higher distractor density).
+    pair_mask : optional boolean over pairs; pairs outside it are never predicted (used for per-bin sweeps).
+    """
+    if mask is None:
+        mask = np.ones(len(n_true_per_s1), dtype=bool)
+    if pair_mask is not None:
+        s1_code, prob, label = s1_code[pair_mask], prob[pair_mask], label[pair_mask]
+        if fp_weight is not None:
+            fp_weight = fp_weight[pair_mask]
+    order = np.argsort(-prob, kind='stable')
+    s1_o = s1_code[order]
+    lab_o = label[order].astype(np.float64)
+    prob_o = prob[order]
+    w_o = None if fp_weight is None else np.where(lab_o > 0, 1.0, fp_weight[order].astype(np.float64))
+    results = []
+    n_s1 = len(n_true_per_s1)
+    for t in grid:
+        k = int(np.searchsorted(-prob_o, -t, side='right'))  # pairs with prob >= t
+        tp = np.bincount(s1_o[:k], weights=lab_o[:k], minlength=n_s1)
+        if w_o is None:
+            n_pred = np.bincount(s1_o[:k], minlength=n_s1)
         else:
-            f05 = (1.25 * precision * recall) / ((0.25 * precision) + recall)
-            f05_scores.append(f05)
-            
-    return np.mean(f05_scores)
+            n_pred = np.bincount(s1_o[:k], weights=w_o[:k], minlength=n_s1)
+        f = f05_from_counts(n_pred, n_true_per_s1, tp)
+        results.append((float(t), float(f[mask].mean())))
+    return results
 
-def evaluate(model_path="fallback_model.pkl", limit=2000, offset=10000):
-    logging.info(f"Loading S1 validation data (Rows {offset} to {offset+limit})...")
-    
-    # We only take a subset of S1
-    df_s1 = load_data("../../../dataset/train/train_source1.tsv").iloc[offset:offset+limit]
-    s1_ids = df_s1['entity_id'].tolist()
-    
-    # We MUST find the true matches for these specific S1 rows
-    gt_full = load_data("../../../dataset/train/train_ground_truth.tsv")
-    gt = gt_full[gt_full['source1_entity_id'].isin(s1_ids)]
-    
-    gt_dict = {}
-    true_s23_ids = set()
-    for _, row in gt.iterrows():
-        s1 = row['source1_entity_id']
-        matches = str(row['matched_entity_ids']).split(',')
-        valid_matches = set(m for m in matches if m)
-        gt_dict[s1] = valid_matches
-        true_s23_ids.update(valid_matches)
-        
-    logging.info(f"Identified {len(true_s23_ids)} true S2/S3 matches for these S1 rows.")
-    
-    # We load S2 and S3, but to prevent RAM explosion locally, we filter them to include:
-    # 1. All true matches for our S1 set
-    # 2. 50,000 random rows as noise (haystack)
-    logging.info("Loading S2 and S3 (with smart filtering for local eval)...")
-    df_s2_full = load_data("../../../dataset/train/train_source2.tsv")
-    df_s3_full = load_data("../../../dataset/train/train_source3.tsv")
-    df_s23_full = pd.concat([df_s2_full, df_s3_full], ignore_index=True)
-    
-    # Create the smart subset
-    mask_true = df_s23_full['entity_id'].isin(true_s23_ids)
-    df_s23_true = df_s23_full[mask_true]
-    df_s23_noise = df_s23_full[~mask_true].sample(n=50000, random_state=42)
-    df_s23 = pd.concat([df_s23_true, df_s23_noise], ignore_index=True)
-    
-    logging.info("Preprocessing...")
-    df_s1 = preprocess_dataframe(df_s1)
-    df_s23 = preprocess_dataframe(df_s23)
-    
-    logging.info("Generating candidates (Blocking)...")
-    candidate_pairs = generate_candidates(df_s1, df_s23)
-    
-    logging.info("Extracting features...")
-    feature_df = extract_features(df_s1, df_s23, candidate_pairs)
-    
-    logging.info("Loading model and running predictions...")
-    try:
-        with open(model_path, "rb") as f:
-            model = pickle.load(f)
-    except FileNotFoundError:
-        logging.error("Model not found! Did you run train.py first?")
-        return
-        
-    feature_cols = [c for c in feature_df.columns if c not in ['s1_id', 's23_id', 'label']]
-    X = feature_df[feature_cols] if not feature_df.empty else pd.DataFrame()
-    
-    predictions_dict = {}
-    if not feature_df.empty:
-        probs = model.predict_proba(X)[:, 1]
-        for i, prob in enumerate(probs):
-            if prob >= 0.7:  # Threshold
-                s1 = feature_df.iloc[i]['s1_id']
-                s23 = feature_df.iloc[i]['s23_id']
-                if s1 not in predictions_dict:
-                    predictions_dict[s1] = set()
-                predictions_dict[s1].add(s23)
-                
-    logging.info("Calculating Macro F0.5 Score...")
-    score = calculate_f05_macro(predictions_dict, gt_dict, s1_ids)
-    
-    print("\n" + "="*50)
-    print(f"📊 LOCAL VALIDATION F0.5 SCORE: {score:.5f}")
-    print("="*50 + "\n")
 
-if __name__ == "__main__":
-    evaluate()
+def score_selection(mask_sel, s1_code, label, n_true_per_s1, fp_weight=None):
+    """Macro F0.5 (optionally with weighted false positives) of a boolean pair selection."""
+    n_s1 = len(n_true_per_s1)
+    lab = label[mask_sel].astype(np.float64)
+    tp = np.bincount(s1_code[mask_sel], weights=lab, minlength=n_s1)
+    if fp_weight is None:
+        n_pred = np.bincount(s1_code[mask_sel], minlength=n_s1).astype(np.float64)
+    else:
+        w = np.where(lab > 0, 1.0, fp_weight[mask_sel].astype(np.float64))
+        n_pred = np.bincount(s1_code[mask_sel], weights=w, minlength=n_s1)
+    return f05_from_counts(n_pred, n_true_per_s1, tp)
+
+
+def best_threshold(results):
+    t, f = max(results, key=lambda r: r[1])
+    return t, f
+
+
+def evaluate_prediction_sets(pred_dict, gt_dict, s1_ids):
+    """Dict-based (slower) evaluation for final sanity checks: {s1_id: set(s23_id)}."""
+    scores = []
+    for s in s1_ids:
+        yt = gt_dict.get(s, set())
+        yp = pred_dict.get(s, set())
+        if not yt:
+            scores.append(1.0 if not yp else 0.0)
+            continue
+        if not yp:
+            scores.append(0.0)
+            continue
+        tp = len(yt & yp)
+        fp = len(yp - yt)
+        fn = len(yt - yp)
+        d = 1.25 * tp + 0.25 * fn + fp
+        scores.append(1.25 * tp / d if d > 0 else 0.0)
+    return float(np.mean(scores))
+
+
+def build_ground_truth_dict(gt_df):
+    out = {}
+    for s1_id, matched in zip(gt_df['source1_entity_id'].values, gt_df['matched_entity_ids'].values):
+        matched = str(matched)
+        out[s1_id] = set(m.strip() for m in matched.split(',') if m.strip()) if matched else set()
+    return out
+
+
+def per_group_report(s1_code, prob, label, n_true_per_s1, group_of_s1, thresholds_by_group, grid):
+    """Log the best per-group threshold and F0.5 for diagnostics."""
+    rep = {}
+    for g in pd.unique(group_of_s1):
+        mask = group_of_s1 == g
+        res = threshold_sweep(s1_code, prob, label, n_true_per_s1, grid, mask=mask)
+        t, f = best_threshold(res)
+        rep[g] = (t, f, int(mask.sum()))
+        log.info(f"  group={g}: best threshold={t:.3f} macro-F0.5={f:.5f} (n_s1={int(mask.sum()):,})")
+    return rep

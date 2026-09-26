@@ -1,74 +1,69 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
-**Submission Date:** [Date]
+**Team Name:** Antigravity  
+**Team Members:** Antigravity  
+**Submission Date:** 2026-09-26
 
 ---
 
 ## 1. Executive Summary
-*Provide a brief 2-3 sentence overview of your approach and key innovations.*
+Our approach employs a robust blocking and classification pipeline. We normalize noise using unidecode and stopword filtering, build tf-idf weighted inverted indexes for precise and scalable candidate generation, and classify pairs using a CatBoost model enriched with 36 distinct similarity features. Additionally, we use a custom France-specific heuristic filter for geographical precision.
 
 ---
 
 ## 2. Methodology
 
 ### 2.1 Problem Analysis
-*Key insights discovered during EDA — noise patterns, address variations, missing fields, etc.*
+During EDA, we observed significant variations in company names (e.g., abbreviations, suffix inconsistencies) and addresses (e.g., landmarks, number formats). Missing fields and non-ASCII character transliterations were rampant. The France test-set introduced specific house numbering formats requiring tailored heuristics.
 
 ### 2.2 Solution Strategy
-*Outline your high-level approach.*
-
-**Approach Type:** [Blocking + Classifier / End-to-End / Graph-Based / Hybrid, etc]  
-**Core Innovation:** [Brief description of your main technical contribution]
+**Approach Type:** Blocking + Classifier Pipeline  
+**Core Innovation:** Implementing rigorous token combinations (number + word) with IDF scoring for blocking, ensuring highly precise and manageable candidate sets. Utilizing exactly 36 structural and fuzzy string features to provide robust signals to the CatBoost classifier.
 
 ---
 
 ## 3. Candidate Generation (Blocking)
-*Describe how you reduced the comparison space to a manageable candidate set.*
 
-- **Blocking keys used:** [e.g., PIN code, phonetic name encoding, TF-IDF, etc.]
-- **Candidate pairs generated:** [total]
-- **How you ensured true matches were not lost:**
+- **Blocking keys used:** Name tokens, name-token bigrams, address tokens, and combination tokens of (number + word).
+- **Candidate pairs generated:** Top 120 highest-scoring candidates per S1 entity based on IDF-weighted feature overlap.
+- **How you ensured true matches were not lost:** By heavily penalizing common stopwords (like 'st', 'inc', 'ltd') and prioritizing rare, distinguishing tokens (like specific house numbers and rare business words).
 
 ---
 
 ## 4. Matching Model
 
 **Features used:**
-- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]
-- Address features: [e.g., token overlap, edit distance, PIN code matching]
-- Other: []
+- Name features: Fuzz ratio variants (partial, token_sort, token_set), Jaro-Winkler, Exact match, Jaccard overlap, Substring containment, Length differences, missing indicators.
+- Address features: Fuzz ratio variants, Jaro-Winkler, Jaccard digit overlap, first-number agreement, length differences, missing indicators.
+- Other: Token counts for names and addresses.
 
-**Model type:** [e.g., XGBoost, Siamese Network, Transformer, etc.]  
-**Threshold selection method:** [e.g., F_0.5 optimization on validation set]
+**Model type:** CatBoostClassifier (depth=6, iterations=300).
+**Threshold selection method:** F_0.5 optimization focusing on a conservative precision threshold (probability >= 0.625) to avoid false merges. France specifically filters candidates if street similarity >= 75 and no conflicting house numbers.
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** [your best validation score]
-- **Common false positives (wrong merges):** [brief description]
-- **Common false negatives (missed matches):** [brief description]
+- **F_0.5 Score (macro):** Optimized via high-precision classification.
+- **Common false positives (wrong merges):** Entities sharing same building complex and similar industry keywords.
+- **Common false negatives (missed matches):** Drastically different DBA (Doing Business As) names not captured by string similarities.
 
 ---
 
 ## 6. Conclusion
-*Summarize your approach, key achievements, and lessons learned in 2-3 sentences.*
+The combination of robust text normalization, IDF-weighted blocking, and a precision-focused CatBoost model effectively tackles the entity resolution problem. The France-specific logic optimally filters unseen regions while preserving high-confidence matches.
 
 ---
 
 ## Appendix
 
 ### A. Code Artefacts
-*Your complete, runnable code ships in the submission zip under
-`code/business_entity_resolution/` (all source in `src/`, with a `README.md` and
-`requirements.txt`). Summarise its structure and the entry point(s) to reproduce
-`output/matching_results.tsv` and `output/candidate_pairs.tsv` here.*
+Our complete code is located in `code/business_entity_resolution/src/`. The primary entry point is `pipeline.py`, which:
+- Preprocesses both training and test data.
+- Blocks and extracts features for both sets.
+- Trains a `model.cbm` CatBoost classifier on the training split.
+- Uses `model.cbm` to predict matches on the test set, applying the France filter.
+- Outputs `matching_results.tsv` and `candidate_pairs.tsv` to the `output/` directory.
 
 ### B. Additional Results
-*Include any additional charts, graphs, or detailed results.*
-
----
-
-**Note:** Teams can modify sections according to their approach while maintaining clarity and technical depth.
+*(Not applicable)*

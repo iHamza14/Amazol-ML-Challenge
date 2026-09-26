@@ -8,3 +8,5 @@ faiss-cpu
 rank_bm25
 tqdm
 torch
+unidecode
+catboost

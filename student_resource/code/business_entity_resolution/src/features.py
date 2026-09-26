@@ -28,13 +28,15 @@ import logging
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 from blocking import BLOCK_META_COLS
 
 log = logging.getLogger(__name__)
 
 WORKERS = -1
+# admin units the noise generator swaps in TRUE pairs (Telangana was carved out of Andhra Pradesh in 2014)
+ADMIN_ALIASES = {frozenset(('zzintg', 'zzinap'))}
 
 
 # ------------------------------------------------------------------
@@ -275,6 +277,84 @@ def _token_overlap(toks1, toks2, vocab, idf):
     return jacc, contain, n_shared, idf_max, idf_sum, first_eq, last_eq, nt1, nt2
 
 
+_VOWELS = str.maketrans('', '', 'aeiou')
+
+
+def _skeleton(s):
+    """Consonant skeleton: drop vowels, collapse repeated letters ('limittedd' -> 'lmtd')."""
+    if not s:
+        return ''
+    t = s.translate(_VOWELS)
+    out = []
+    prev = ''
+    for ch in t:
+        if ch != prev:
+            out.append(ch)
+        prev = ch
+    return ''.join(out)
+
+
+def _soft_token_match(toks1_list, toks2_list, jw_threshold=0.9):
+    """
+    SoftTFIDF-style token coverage: fraction of tokens (len>=3) on each side that have an exact or
+    near-identical (Jaro-Winkler >= threshold) token on the other side, plus an acronym flag
+    (initials of one side's tokens equal a token of the other side, e.g. 'cpam' vs 'caisse primaire ...').
+    """
+    n = len(toks1_list)
+    cov1 = np.zeros(n, dtype=np.float32)
+    cov2 = np.zeros(n, dtype=np.float32)
+    acro = np.zeros(n, dtype=np.int8)
+    short_edit = np.zeros(n, dtype=np.float32)   # S1 tokens len<=4 (acronyms) with no exact match but a 1-edit neighbour
+    long_edit = np.zeros(n, dtype=np.float32)    # S1 tokens len>=5 with no exact match but a <=2-edit neighbour (typos)
+    sim = JaroWinkler.similarity
+    lev = Levenshtein.distance
+    for i in range(n):
+        t1 = [t for t in toks1_list[i] if len(t) >= 3]
+        t2 = [t for t in toks2_list[i] if len(t) >= 3]
+        if not t1 or not t2:
+            continue
+        s2 = set(t2)
+        s1 = set(t1)
+        m1 = 0
+        for a in t1:
+            if a in s2:
+                m1 += 1
+                continue
+            matched = False
+            for b in t2:
+                if abs(len(a) - len(b)) <= 3 and a[0] == b[0] and sim(a, b) >= jw_threshold:
+                    m1 += 1
+                    matched = True
+                    break
+            # distractor fingerprint: a different acronym ('ye'->'ym', 'nrm'->'rm') vs a typo in a long word
+            if len(a) <= 4:
+                if any(lev(a, b, score_cutoff=1) <= 1 for b in t2 if abs(len(a) - len(b)) <= 1):
+                    short_edit[i] += 1
+            elif not matched:
+                if any(lev(a, b, score_cutoff=2) <= 2 for b in t2 if abs(len(a) - len(b)) <= 2):
+                    long_edit[i] += 1
+        m2 = 0
+        for b in t2:
+            if b in s1:
+                m2 += 1
+                continue
+            for a in t1:
+                if abs(len(a) - len(b)) <= 3 and a[0] == b[0] and sim(a, b) >= jw_threshold:
+                    m2 += 1
+                    break
+        cov1[i] = m1 / len(t1)
+        cov2[i] = m2 / len(t2)
+        if len(toks1_list[i]) >= 2:
+            ini = ''.join(t[0] for t in toks1_list[i])
+            if len(ini) >= 2 and ini in s2:
+                acro[i] = 1
+        if not acro[i] and len(toks2_list[i]) >= 2:
+            ini = ''.join(t[0] for t in toks2_list[i])
+            if len(ini) >= 2 and ini in s1:
+                acro[i] = 1
+    return cov1, cov2, acro, short_edit, long_edit
+
+
 def _common_prefix_ratio(a_list, b_list):
     out = np.zeros(len(a_list), dtype=np.float32)
     for i, (a, b) in enumerate(zip(a_list, b_list)):
@@ -329,6 +409,27 @@ def compute_features(cand, df_s1, df_s23, vecs=None, extra_stats=None):
     F['n_collapsed_ratio'] = _cp(col1, col2, fuzz.ratio)
     F['n_collapsed_partial'] = _cp(col1, col2, fuzz.partial_ratio)
     F['n_prefix_ratio'] = _common_prefix_ratio(col1, col2)
+    # --- comparators from the ER literature (Cohen 2003 SoftTFIDF idea, Foursquare LCS features, Splink ladders) ---
+    from rapidfuzz.distance import LCSseq, Prefix, Postfix, Indel
+    F['n_lcs_core'] = _cp(core1, core2, LCSseq.normalized_similarity) * 100.0
+    F['n_indel_collapsed'] = _cp(col1, col2, Indel.normalized_similarity) * 100.0
+    F['n_postfix_collapsed'] = _cp(col1, col2, Postfix.normalized_similarity) * 100.0
+    sk1 = [_skeleton(s) for s in core1]
+    sk2 = [_skeleton(s) for s in core2]
+    F['n_skel_ratio'] = _cp(sk1, sk2, fuzz.ratio)            # consonant skeleton: robust to vowel/schwa noise
+    F['n_skel_tset'] = _cp(sk1, sk2, fuzz.token_set_ratio)
+    soft_cov1, soft_cov2, acro, short_edit, long_edit = _soft_token_match([s.split() for s in core1], [s.split() for s in core2])
+    F['n_soft_cov_s1'] = soft_cov1        # fraction of S1 name tokens with a near-identical (JW>=0.9) S2/S3 token
+    F['n_soft_cov_s23'] = soft_cov2
+    F['n_acronym'] = acro                # initials of one side's tokens == a token of the other side
+    F['n_short_edit'] = short_edit       # acronym-letter edits ('ye'->'ym'): distractor fingerprint
+    F['n_long_edit'] = long_edit         # typo edits in long words: ordinary noise
+    # random generated names ('Iriecto', 'Belonovivio') are 100% out of the S1 vocabulary; the generator's
+    # distractors never use random strings, so OOV + matching address is a POSITIVE signal
+    F['x_oov_s1'] = g1('name_oov_frac').astype(np.float32) if 'name_oov_frac' in df_s1.columns else np.zeros(n, dtype=np.float32)
+    F['x_oov_s23'] = g2('name_oov_frac').astype(np.float32) if 'name_oov_frac' in df_s23.columns else np.zeros(n, dtype=np.float32)
+    # how many S1 entities of the country carry exactly the candidate's core name (chains vs unique names)
+    F['s23_core_s1_count'] = np.log1p(g2('s1_core_count').astype(np.float32)) if 's1_core_count' in df_s23.columns else np.zeros(n, dtype=np.float32)
     has_alt = np.array([bool(a) for a in alt2])
     alt_sim = np.zeros(n, dtype=np.float32)
     if has_alt.any():
@@ -424,7 +525,7 @@ def compute_features(cand, df_s1, df_s23, vecs=None, extra_stats=None):
     for i in range(n):
         x, y = adm1[i], adm2[i]
         if x and y:
-            adm_rel[i] = 2 if x == y else 3
+            adm_rel[i] = 2 if (x == y or frozenset((x, y)) in ADMIN_ALIASES) else 3
         elif x or y:
             adm_rel[i] = 1
     F['a_admin_rel'] = adm_rel
@@ -449,11 +550,14 @@ def compute_features(cand, df_s1, df_s23, vecs=None, extra_stats=None):
     feat = add_group_features(feat, p1)
     # Absolute pool-density counts shift between train (4.67 S2/S3 per S1) and test (5.75): teams that used
     # them gained on validation and lost on the leaderboard. Keep ranks/gaps, drop raw counts.
-    feat = feat.drop(columns=[c for c in DENSITY_SENSITIVE_COLS if c in feat.columns])
+    # legal_code_s23: French legal-form codes (SARL/SAS/SA/SCI families) never occur in training, so the raw
+    # code would route unseen values arbitrarily; only the relation (same/different family) is kept.
+    feat = feat.drop(columns=[c for c in DROP_COLS if c in feat.columns])
     return feat
 
 
-DENSITY_SENSITIVE_COLS = ['cand_count', 'g_n_first_eq', 'g_n_high_name']
+DROP_COLS = ['cand_count', 'g_n_first_eq', 'g_n_high_name', 'legal_code_s23']
+DENSITY_SENSITIVE_COLS = DROP_COLS
 
 
 def add_group_features(feat, s1_pos):

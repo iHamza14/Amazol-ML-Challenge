@@ -143,6 +143,8 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
             log.warning(f"  no S2/S3 rows for {country}: all S1 entities of this country are singletons")
             continue
         df_s23_c = preprocess_dataframe(df_s23_c, translit=trans, seg_vocab=seg, n_jobs=cfg.N_JOBS)
+        core_counts = df_s1.loc[s1_country == country, 'name_core'].value_counts()
+        df_s23_c['s1_core_count'] = df_s23_c['name_core'].map(core_counts).fillna(0).astype(np.int32)
         s23_ids_c = df_s23_c['entity_id'].values
         mask_c = s1_country == country
         n_pairs = 0
@@ -199,6 +201,18 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
         P_noaddr = np.zeros(0, dtype=bool)
     P_p = combine_probs(P_models, weights, dec.get('prob_mode', 'mean'))
     P_country = s1_country[P_s1]
+    if dec.get('calibrated') and dec.get('calibrators'):
+        # per-country isotonic calibration (fitted on validation); unseen countries get the mean of the seen curves
+        cals = dec['calibrators']
+        P_c = P_p.copy()
+        for c in pd.unique(P_country):
+            cm = P_country == c
+            if c in cals:
+                P_c[cm] = np.interp(P_p[cm], cals[c]['x'], cals[c]['y']).astype(np.float32)
+            else:
+                P_c[cm] = np.mean([np.interp(P_p[cm], cal['x'], cal['y']) for cal in cals.values()], axis=0).astype(np.float32)
+        P_p = P_c
+        log.info("  applied isotonic calibration before the expected-F0.5 decision")
     P_group = pair_groups(P_country, P_noaddr, per_bin=mcfg.get('per_bin_thresholds', True))
     s23_code = pd.factorize(P_s23)[0]
 

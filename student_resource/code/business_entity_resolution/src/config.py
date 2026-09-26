@@ -132,6 +132,17 @@ SINGLETON_FLOOR = 0.0                    # legacy; decision uses thresholds dire
 RESOLVE_S23_CONFLICTS = True             # each S2/S3 record belongs to at most one S1 entity
 USE_EXPECTED_F05 = True                  # compare threshold rule vs expected-F0.5 set selection on val
 USE_CONSENSUS = True                     # also evaluate min(model probs) instead of the mean (precision filter)
+EXTRA_LINK_DELTA_GRID = [0.0, 0.05, 0.10, 0.15]   # size-adaptive acceptance: 2nd+ links need prob >= floor + delta
+
+# ============================================================
+# Experiments (all off by default)
+# ============================================================
+# ER_LOCO=us  -> train/stats on that country only, validate on the OTHER seen country as if unseen
+#                (measures the unseen-country threshold shift; France proxy)
+LOCO_COUNTRY = os.environ.get('ER_LOCO', '').lower().strip() or None
+# ER_MACRO_WEIGHTS=1 -> weight positive pairs by 1/(true matches of the entity) so the loss follows the
+#                       macro (per-entity) metric instead of favouring many-match entities
+MACRO_WEIGHTS = os.environ.get('ER_MACRO_WEIGHTS', '0') == '1'
 
 # ============================================================
 # France post-processing

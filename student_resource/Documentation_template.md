@@ -104,10 +104,20 @@ held-out split. Every candidate keeps its score and rank in every channel as mod
   absolute difference, digit Hamming distance, shared-number count and Jaccard, S1 numbers ⊆ S2/S3
   numbers, extra / missing numbers, range containment (`628-632`), digit-string containment
   (`1-02` vs `102`).
-- Retrieval: per-channel score and rank, number of channels, candidate count.
+- Literature comparators: longest-common-subsequence, Indel and postfix similarities, consonant-skeleton
+  similarity (vowel/schwa noise), SoftTFIDF-style token coverage (Jaro-Winkler ≥ 0.9 per token),
+  acronym match, and edit counts split by token length (a one-letter edit in a ≤4-letter acronym is
+  the distractor generator's fingerprint — `YE Agro`→`YM Agro` — while edits in long words are
+  ordinary typos).
+- Error-analysis features: out-of-vocabulary fraction of each name against the S1 vocabulary (random
+  generated names such as `Iriecto` are 100 % OOV and, unlike distractors, sit at the true address),
+  number of S1 entities carrying exactly the candidate's core name (chains vs unique names),
+  Telangana↔Andhra Pradesh treated as the same admin unit.
+- Retrieval: per-channel score and rank, number of channels, fused rank, reverse-channel rank/score.
 - Group-relative (within the S1 entity's candidate set): gap to the best candidate on name,
-  address, street, joint cosine and retrieval score; rank by combined similarity; number of
-  candidates with an equal house number; number of high-name-similarity candidates.
+  address, street, joint cosine and retrieval score; rank by combined similarity. Absolute pool-density
+  counts (candidate count, number of equal-house-number candidates) were deliberately removed because
+  the test pool is denser than the training pool.
 
 **Model type:** LightGBM (255 leaves, lr 0.05, early stopping) + CatBoost (depth 8, GPU), averaged.
 Training rows: all positives plus the top-20 ranked negatives per entity plus a 20 % sample of

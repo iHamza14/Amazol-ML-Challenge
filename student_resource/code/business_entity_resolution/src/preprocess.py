@@ -60,6 +60,7 @@ _NUM_RE = re.compile(r'\d+')
 _HYPHEN_NUM_RE = re.compile(r'\b(\d+)\s*[-/]\s*(\d+)\b')
 _POSTAL_RE = re.compile(r'^\d{5,6}$')
 _JUNK_ADDR_RE = re.compile(r'\b(?:n/a|<null>|null|none|nil|na)\b')
+_ELISION_RE = re.compile(r"\b(l|d|qu|j|n|m|t|s|c)'(?=[a-z])")
 
 _STOP = T.STOPWORDS_BLOCKING
 _FILLER = T.NAME_FILLER_WORDS
@@ -266,9 +267,12 @@ def normalize_name(raw):
             if _LEET_TOKEN_RE.match(collapsed_seed) else collapsed_seed
         s = _SEG.segment(collapsed_seed) if _SEG is not None else collapsed_seed
 
-    # symbols and punctuation
+    # symbols and punctuation; French elisions (l'atelier -> l atelier) before apostrophes are dropped,
+    # English possessives (celestyna's) stay glued
     s = s.replace('&', ' and ').replace('+', ' and ').replace('@', ' at ')
-    s = s.replace("'", '').replace('’', '')
+    s = s.replace('’', "'").replace('`', "'")
+    s = _ELISION_RE.sub(r'\1 ', s)
+    s = s.replace("'", '')
     s = _NONALNUM_RE.sub(' ', s)
     s = _WS_RE.sub(' ', s).strip()
     s = _LEAD_JUNK_RE.sub('', s)
@@ -304,10 +308,17 @@ def normalize_name(raw):
     collapsed = collapsed_seed if collapsed_seed is not None else core.replace(' ', '')
     if alt:
         alt = _WS_RE.sub(' ', _NONALNUM_RE.sub(' ', alt.replace('&', ' and '))).strip()
+    # fraction of core tokens (len>=4) unknown to the S1 vocabulary: random generated names ('Iriecto',
+    # 'Belonovivio') are 100% out-of-vocabulary, real names ~0%, typos in between
+    long_toks = [t for t in core_toks if len(t) >= 4]
+    if _SEG is not None and long_toks:
+        oov = sum(1 for t in long_toks if t not in _SEG.words) / len(long_toks)
+    else:
+        oov = 0.0
     return {
         'name_norm': s, 'name_core': core, 'name_strict': strict, 'name_collapsed': collapsed,
         'name_alt': alt, 'is_domain': is_domain, 'has_dba': has_dba, 'name_script': script,
-        'legal_code': legal_code,
+        'legal_code': legal_code, 'name_oov_frac': oov,
     }
 
 
@@ -433,7 +444,7 @@ def normalize_address(raw, country):
 # Batch processing
 # ------------------------------------------------------------------
 NAME_COLS = ['name_norm', 'name_core', 'name_strict', 'name_collapsed', 'name_alt',
-             'is_domain', 'has_dba', 'name_script', 'legal_code']
+             'is_domain', 'has_dba', 'name_script', 'legal_code', 'name_oov_frac']
 ADDR_COLS = ['addr_norm', 'street', 'admin', 'postal', 'nums', 'first_num', 'ranges',
              'n_components', 'addr_tokens', 'addr_words']
 

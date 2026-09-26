@@ -117,9 +117,44 @@ def decide(s1_code, s23_code, prob, country, cfg_dec):
             mask &= prob >= floor
     else:
         mask = threshold_select(prob, country, cfg_dec.get('thresholds') or {}, cfg_dec.get('default_threshold', 0.5))
+    delta = float(cfg_dec.get('extra_link_delta', 0.0) or 0.0)
+    if delta > 0:
+        t_pair = pair_thresholds(country, cfg_dec.get('thresholds') or {}, cfg_dec.get('default_threshold', 0.5))
+        mask = size_adaptive(s1_code, prob, mask, t_pair + delta)
     if cfg_dec.get('resolve_conflicts', True):
         mask = resolve_conflicts(s1_code, s23_code, prob, mask)
     return mask
+
+
+def pair_thresholds(group, thresholds, default):
+    """Per-pair threshold array from a {group: threshold} dict."""
+    t = np.full(len(group), float(default), dtype=np.float64)
+    group = np.asarray(group)
+    for g, th in thresholds.items():
+        t[group == g] = float(th)
+    return t
+
+
+def size_adaptive(s1_code, prob, mask, floor):
+    """
+    Size-adaptive acceptance (Foursquare 4th place post-processing, adapted to F0.5): within an entity the
+    best selected candidate is always kept; every further selected candidate must satisfy
+    prob >= floor (= its bin threshold + delta). Extra false links cost 4x a missed link in F0.5.
+    `floor` is a per-pair array.
+    """
+    idx = np.flatnonzero(mask)
+    if len(idx) == 0:
+        return mask
+    order = idx[np.lexsort((-prob[idx], s1_code[idx]))]
+    s = s1_code[order]
+    p = prob[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(s)) + 1]
+    counts = np.diff(np.r_[starts, len(s)])
+    within = np.arange(len(s)) - np.repeat(starts, counts)
+    keep = (within == 0) | (p >= floor[order])
+    new_mask = np.zeros_like(mask)
+    new_mask[order[keep]] = True
+    return new_mask
 
 
 def calibrate_unseen_threshold(prob, s1_code, n_s1, start_t, target_empty_rate, max_t=0.97, step=0.005):

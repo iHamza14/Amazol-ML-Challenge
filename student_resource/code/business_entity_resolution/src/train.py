@@ -32,7 +32,8 @@ from translit import Transliterator
 from blocking import iter_candidate_chunks
 from features import compute_features, compute_features_parallel, ExtraTokenStats, feature_columns
 from evaluate import threshold_sweep, best_threshold, f05_from_counts, score_selection
-from decision import decide, resolve_conflicts, expected_f05_select, threshold_select, pair_groups
+from decision import (decide, resolve_conflicts, expected_f05_select, threshold_select, pair_groups,
+                      size_adaptive, calibrate_unseen_threshold, pair_thresholds)
 from france_filter import apply_france_filter
 
 log = logging.getLogger('train')
@@ -150,20 +151,38 @@ def main():
 
     # ---------------- 5. splits ----------------
     n_s1 = len(df_s1)
-    perm = rng.permutation(n_s1)
-    n_train = min(cfg.TRAIN_S1_ENTITIES, int(0.6 * n_s1))
-    n_stats = min(300000, int(0.75 * n_train), n_s1 - n_train)
-    n_val = min(cfg.VAL_S1_ENTITIES, int(0.25 * n_train), n_s1 - n_train - n_stats)
-    train_pos = np.sort(perm[:n_train])
-    stats_pos = np.sort(perm[n_train:n_train + n_stats])
-    val_pos = np.sort(perm[n_train + n_stats:n_train + n_stats + n_val])
+    s1_country = df_s1['country_norm'].values
+    if cfg.LOCO_COUNTRY:
+        # leave-one-country-out: learn everything on one seen country, validate on the other as if unseen
+        pool_train = np.flatnonzero(s1_country == cfg.LOCO_COUNTRY)
+        pool_val = np.flatnonzero(s1_country != cfg.LOCO_COUNTRY)
+        if len(pool_train) == 0 or len(pool_val) == 0:
+            raise SystemExit(f"ER_LOCO={cfg.LOCO_COUNTRY}: need S1 rows both in and outside that country")
+        perm_t = rng.permutation(pool_train)
+        perm_v = rng.permutation(pool_val)
+        n_train = min(cfg.TRAIN_S1_ENTITIES, int(0.5 * len(pool_train)))
+        n_stats = min(300000, int(0.75 * n_train), max(0, int(0.8 * len(pool_train)) - n_train))
+        n_val_unseen = min(cfg.VAL_S1_ENTITIES, len(pool_val))
+        n_val_in = min(cfg.VAL_S1_ENTITIES // 2, len(pool_train) - n_train - n_stats)   # in-country holdout
+        train_pos = np.sort(perm_t[:n_train])
+        stats_pos = np.sort(perm_t[n_train:n_train + n_stats])
+        val_pos = np.sort(np.concatenate([perm_v[:n_val_unseen], perm_t[n_train + n_stats:n_train + n_stats + n_val_in]]))
+        n_val = len(val_pos)
+        log.info(f"STEP 5 (LOCO {cfg.LOCO_COUNTRY}): train={n_train:,} stats={n_stats:,} from {cfg.LOCO_COUNTRY}; "
+                 f"val = {n_val_unseen:,} UNSEEN ({sorted(set(s1_country[perm_v[:n_val_unseen]]))}) + {n_val_in:,} in-country holdout")
+    else:
+        perm = rng.permutation(n_s1)
+        n_train = min(cfg.TRAIN_S1_ENTITIES, int(0.6 * n_s1))
+        n_stats = min(300000, int(0.75 * n_train), n_s1 - n_train)
+        n_val = min(cfg.VAL_S1_ENTITIES, int(0.25 * n_train), n_s1 - n_train - n_stats)
+        train_pos = np.sort(perm[:n_train])
+        stats_pos = np.sort(perm[n_train:n_train + n_stats])
+        val_pos = np.sort(perm[n_train + n_stats:n_train + n_stats + n_val])
+        log.info(f"STEP 5: splits  train={n_train:,}  stats={n_stats:,}  val={n_val:,}")
     split = np.zeros(n_s1, dtype=np.int8)      # 0 unused, 1 train, 2 stats, 3 val
     split[train_pos] = 1
     split[stats_pos] = 2
     split[val_pos] = 3
-    log.info(f"STEP 5: splits  train={n_train:,}  stats={n_stats:,}  val={n_val:,}")
-
-    s1_country = df_s1['country_norm'].values
     df_s23_raw['country_norm'] = df_s23_raw['country'].map(lambda x: str(x).lower().strip())
     countries = pd.unique(s1_country)
 
@@ -179,7 +198,11 @@ def main():
         """Preprocess (or fetch cached) S2/S3 rows of one country."""
         if country not in preprocessed_s23:
             df_c = df_s23_raw[df_s23_raw['country_norm'] == country].copy()
-            preprocessed_s23[country] = preprocess_dataframe(df_c, translit=trans, seg_vocab=seg, n_jobs=cfg.N_JOBS)
+            df_c = preprocess_dataframe(df_c, translit=trans, seg_vocab=seg, n_jobs=cfg.N_JOBS)
+            # how many S1 entities of the country carry exactly this record's core name (chain / ambiguity signal)
+            core_counts = df_s1.loc[s1_country == country, 'name_core'].value_counts()
+            df_c['s1_core_count'] = df_c['name_core'].map(core_counts).fillna(0).astype(np.int32)
+            preprocessed_s23[country] = df_c
         return preprocessed_s23[country]
 
     keep_s23_cached = os.environ.get('ER_CACHE_S23', '1' if len(df_s23_raw) < 4_000_000 else '0') == '1'
@@ -244,6 +267,8 @@ def main():
             if len(cand) == 0:
                 continue
             feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.N_JOBS)
+            if feat_cols is None:          # (LOCO: the validation country may come before any training chunk)
+                feat_cols = feature_columns(feat)
             lab = (owner_c[cand['s23_pos'].values] == cand['s1_pos'].values).astype(np.int8)
             val_X.append(feat[feat_cols].values.astype(FEAT_DTYPE))
             val_y.append(lab)
@@ -282,7 +307,13 @@ def main():
     log.info("=" * 70)
     log.info("STEP 9: training models")
     import lightgbm as lgb
-    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=feat_cols, free_raw_data=False)
+    w_tr = None
+    if cfg.MACRO_WEIGHTS:
+        # macro metric: every entity counts once -> positive pairs weighted 1/(true matches of the entity)
+        nt = np.maximum(1, n_true_all[meta_tr['s1_pos'].values]).astype(np.float32)
+        w_tr = np.where(y_tr > 0, 1.0 / nt, 1.0).astype(np.float32)
+        log.info(f"  macro sample weights on (mean positive weight {w_tr[y_tr > 0].mean():.3f})")
+    dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, feature_name=feat_cols, free_raw_data=False)
     dval = lgb.Dataset(X_va, label=y_va, reference=dtrain, free_raw_data=False)
     params = dict(cfg.LGBM_PARAMS)
     booster = lgb.train(params, dtrain, num_boost_round=cfg.LGBM_ROUNDS, valid_sets=[dval],
@@ -299,7 +330,7 @@ def main():
         try:
             from catboost import CatBoostClassifier
             cb = CatBoostClassifier(**cfg.CATBOOST_PARAMS)
-            cb.fit(X_tr, y_tr, eval_set=(X_va, y_va), use_best_model=True)
+            cb.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=(X_va, y_va), use_best_model=True)
             cb.save_model(os.path.join(cfg.MODEL_DIR, 'catboost.cbm'))
             probs['catboost'] = cb.predict_proba(X_va)[:, 1]
         except Exception as e:  # noqa
@@ -380,10 +411,21 @@ def main():
         log.info(f"  [{pm}] + conflict resolution: adj-F0.5={f_adj_rc:.5f} {pc} | plain={f_plain_rc:.5f}")
         use_rc = f_adj_rc >= f_adj
         cand_best = {'mode': 'threshold', 'prob_mode': pm, 'thresholds': {k: float(v) for k, v in thresholds.items()},
-                     'default_threshold': float(t_glob), 'resolve_conflicts': bool(use_rc),
+                     'default_threshold': float(t_glob), 'resolve_conflicts': bool(use_rc), 'extra_link_delta': 0.0,
                      'score_adj': max(f_adj, f_adj_rc), 'score_plain': f_plain_rc if use_rc else f_plain}
         if best is None or cand_best['score_adj'] > best['score_adj']:
             best = cand_best
+        # size-adaptive acceptance: 2nd+ links of an entity need prob >= entity floor + delta
+        t_pair = pair_thresholds(group_pair, thresholds, t_glob)
+        for delta in [d for d in cfg.EXTRA_LINK_DELTA_GRID if d > 0]:
+            m_sa = size_adaptive(s1_code, P, m_thr, t_pair + delta)
+            if use_rc:
+                m_sa = resolve_conflicts(s1_code, s23_code, P, m_sa)
+            f_sa, _ = score_mask(m_sa)
+            f_sa_plain, _ = score_mask(m_sa, adjusted=False)
+            log.info(f"  [{pm}] size-adaptive delta={delta:.2f}: adj-F0.5={f_sa:.5f} plain={f_sa_plain:.5f}")
+            if f_sa > best['score_adj']:
+                best = dict(cand_best, extra_link_delta=float(delta), score_adj=f_sa, score_plain=f_sa_plain)
         if cfg.USE_EXPECTED_F05:
             for floor in (0.0, 0.3, 0.4):
                 m_ef = expected_f05_select(s1_code, P, min_prob=0.05)
@@ -399,7 +441,55 @@ def main():
                             'ef_floor_default': float(floor), 'ef_min_prob': 0.05, 'default_threshold': float(t_glob),
                             'resolve_conflicts': bool(f_ef_rc >= f_ef), 'score_adj': max(f_ef, f_ef_rc), 'score_plain': f_ef_plain}
 
-    P_best = prob_modes[best['prob_mode']]
+    # ---------- isotonic calibration (2-fold within validation, honest) + expected-F0.5 ----------
+    # Boosted trees are systematically mis-calibrated (Niculescu-Mizil & Caruana 2005); the expected-F rule
+    # needs calibrated probabilities. Calibrators are fitted per country on one half of the validation
+    # entities and applied to the other half for scoring; the final calibrators (all validation pairs)
+    # are saved for inference only if this variant wins.
+    from sklearn.isotonic import IsotonicRegression
+
+    def fit_iso(p, y):
+        ir = IsotonicRegression(out_of_bounds='clip', y_min=0.0, y_max=1.0).fit(p.astype(np.float64), y.astype(np.float64))
+        return {'x': ir.X_thresholds_.astype(float).tolist(), 'y': ir.y_thresholds_.astype(float).tolist()}
+
+    def apply_iso(cal, p):
+        return np.interp(p, cal['x'], cal['y']).astype(np.float32)
+
+    fold = (s1_code % 2).astype(bool)
+    P_cal_by_pm = {}
+    for pm, P in prob_modes.items():
+        P_cal = P.copy()
+        for c in pd.unique(country_pair):
+            cm = country_pair == c
+            for fa in (False, True):
+                fit_m = cm & (fold == fa)
+                app_m = cm & (fold != fa)
+                if fit_m.sum() >= 1000 and app_m.any():
+                    P_cal[app_m] = apply_iso(fit_iso(P[fit_m], lab[fit_m]), P[app_m])
+        P_cal_by_pm[pm] = P_cal
+        for floor in (0.0, 0.2, 0.3):
+            m_ef = expected_f05_select(s1_code, P_cal, min_prob=0.05)
+            if floor > 0:
+                m_ef &= P_cal >= floor
+            m_ef_rc = resolve_conflicts(s1_code, s23_code, P_cal, m_ef)
+            f_ef, _ = score_mask(m_ef)
+            f_ef_rc, _ = score_mask(m_ef_rc)
+            use_rc = f_ef_rc >= f_ef
+            f_ef_plain, pc_ef = score_mask(m_ef_rc if use_rc else m_ef, adjusted=False)
+            log.info(f"  [{pm}] CALIBRATED expected-F0.5 (floor={floor}): adj {f_ef:.5f} | +conflicts {f_ef_rc:.5f} | plain {f_ef_plain:.5f} {pc_ef}")
+            if max(f_ef, f_ef_rc) > best['score_adj']:
+                best = {'mode': 'expected_f', 'prob_mode': pm, 'calibrated': True,
+                        'thresholds': ({c: float(floor) for c in pd.unique(country_pair)} if floor > 0 else {}),
+                        'ef_floor_default': float(floor), 'ef_min_prob': 0.05,
+                        'default_threshold': float(best['default_threshold']), 'resolve_conflicts': bool(use_rc),
+                        'extra_link_delta': 0.0, 'score_adj': max(f_ef, f_ef_rc), 'score_plain': f_ef_plain}
+    if best.get('calibrated'):
+        P_raw = prob_modes[best['prob_mode']]
+        best['calibrators'] = {c: fit_iso(P_raw[country_pair == c], lab[country_pair == c]) for c in pd.unique(country_pair)}
+        P_best = P_cal_by_pm[best['prob_mode']]          # honest (2-fold) calibrated probabilities for scoring
+        log.info("  calibrated expected-F0.5 selected; per-country isotonic calibrators saved in model_config.json")
+    else:
+        P_best = prob_modes[best['prob_mode']]
     m_best = decide(s1_code, s23_code, P_best, group_pair, best)
     f_best_adj, pc_best_adj = score_mask(m_best)
     f_best, pc_best = score_mask(m_best, adjusted=False)
@@ -410,6 +500,37 @@ def main():
         log.info(f"  France-style filter applied to {c}: plain {f_best:.5f} -> {f_ff:.5f}  (enabled={cfg.FRANCE_ENABLED})")
     log.info(f"  SELECTED decision config: {best}")
     log.info(f"  VAL macro-F0.5 plain = {f_best:.5f} {pc_best} | density-adjusted (test-like) = {f_best_adj:.5f} {pc_best_adj}")
+
+    # ---------- LOCO: how does the France strategy behave on a truly unseen country? ----------
+    if cfg.LOCO_COUNTRY:
+        seen = cfg.LOCO_COUNTRY
+        seen_thr = {k: v for k, v in best['thresholds'].items() if k.split('|')[0] == seen}
+        t_seen = float(seen_thr.get(seen, best['default_threshold']))
+        noaddr_d = float(seen_thr.get(seen + '|noaddr', t_seen) - t_seen)
+        for uc in [c for c in pd.unique(country_of_code) if c != seen]:
+            ent = country_of_code == uc
+            pairs = country_pair == uc
+            n_u = int(ent.sum())
+            remap = -np.ones(len(val_pos), dtype=np.int64)
+            remap[np.flatnonzero(ent)] = np.arange(n_u)
+            codes_u = remap[s1_code[pairs]]
+
+            def unseen_score(thr_main):
+                cfg_u = dict(best, thresholds={uc: thr_main, uc + '|noaddr': min(0.99, thr_main + noaddr_d)}, default_threshold=thr_main)
+                m_u = decide(s1_code, s23_code, P_best, group_pair, cfg_u) & pairs
+                f_u = score_selection(m_u, s1_code, lab, n_true_val)
+                n_pred_u = np.bincount(s1_code[m_u], minlength=len(val_pos))
+                return float(f_u[ent].mean()), float((n_pred_u[ent] == 0).mean()), float(n_pred_u[ent].mean())
+            f_a, e_a, l_a = unseen_score(t_seen)
+            t_cal, _ = calibrate_unseen_threshold(P_best[pairs], codes_u, n_u, t_seen + cfg.UNSEEN_COUNTRY_THRESHOLD_SHIFT,
+                                                  cfg.UNSEEN_TARGET_SINGLETON_RATE, cfg.UNSEEN_MAX_THRESHOLD)
+            f_b, e_b, l_b = unseen_score(t_cal)
+            t_opt = float(best['thresholds'].get(uc, t_seen))
+            f_c, e_c, l_c = unseen_score(t_opt)
+            gt_empty = float((n_true_val[ent] == 0).mean()) if n_u else 0.0
+            log.info(f"  LOCO {seen}->{uc}: seen-threshold {t_seen:.3f}: F0.5={f_a:.5f} empty={e_a:.4f} links={l_a:.3f} | "
+                     f"calibrated {t_cal:.3f}: F0.5={f_b:.5f} empty={e_b:.4f} links={l_b:.3f} | "
+                     f"oracle {t_opt:.3f}: F0.5={f_c:.5f} empty={e_c:.4f} links={l_c:.3f}  (GT empty rate {gt_empty:.4f})")
 
     # ---------- error analysis of the selected decision (plain) ----------
     n_pred = np.bincount(s1_code[m_best], minlength=len(val_pos))

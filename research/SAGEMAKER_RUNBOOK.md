@@ -72,6 +72,13 @@ nohup python train.py > ../../../train_full.log 2>&1 &     # default ER_SAMPLE_S
 | `ER_NO_CATBOOST=1` | off | LightGBM only (faster; CatBoost GPU adds ~5-10 min and a small ensemble gain) |
 | `ER_REVERSE=0` | on | disable the reverse channel (each S2/S3 record's top-5 S1 as rank feature + extra candidate); saves one S2/S3 x S1 sparse product per country (~5-15 min each at full scale) |
 | `ER_DISTRACTOR_RATIO` | 1.9 | false-positive weight on unmatched rows during threshold selection (test pool density) |
+| `ER_LOCO=us` | off | leave-one-country-out experiment: train on US only, validate on India as an UNSEEN country (France proxy). The log line `LOCO us->india: seen-threshold ... | calibrated ... | oracle ...` tells you how much the France calibration recovers. Run once with `ER_SAMPLE_S1=100000`; do not use its models for the submission. |
+| `ER_MACRO_WEIGHTS=1` | off | weight positive pairs by 1/(true matches of the entity) so the loss follows the macro metric; compare `VAL macro-F0.5 density-adjusted` with and without |
+
+The decision selection also evaluates (and logs) size-adaptive acceptance (`size-adaptive delta=...`: 2nd+ links
+of an entity need a higher probability) and isotonic-calibrated expected-F0.5 (`CALIBRATED expected-F0.5`);
+whichever variant wins on the density-adjusted metric is stored in `model_config.json` and applied by
+`inference.py` automatically.
 | `ER_FRANCE_FILTER=1` | off | enable the street-support post filter for unseen countries (hurt seen countries on validation) |
 | `ER_CACHE_S23=1` | auto | keep preprocessed S2/S3 of all countries in RAM (needs 64 GB on full data) |
 | `DATA_ROOT`, `PROJECT_ROOT` | auto | dataset root / where models/ and output/ are written |

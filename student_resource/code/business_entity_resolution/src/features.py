@@ -688,6 +688,8 @@ def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, 
     tasks = (_slice_task(cand_sorted.iloc[a:b], df_s1, df_s23) for a, b in bounds)   # lazy: one slice in flight at a time
     ctx = mp.get_context('fork')
     import gc
+    import time
+    t0 = time.time()
     gc.collect()
     gc.freeze()          # inherited objects go to the permanent generation: nothing in the parent's heap is traversed later
     try:
@@ -697,6 +699,9 @@ def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, 
         gc.unfreeze()
     feat = pd.concat(feats, ignore_index=True)
     del feats
+    dt = max(1e-6, time.time() - t0)
+    log.info(f"  features: {n:,} pairs in {dt:.0f}s ({n / dt:,.0f} pairs/s; {n_workers} workers, {len(bounds)} tasks; "
+             f"parent rss {cfg.rss_gb():.1f} GB)")
     inv = np.empty_like(order)
     inv[order] = np.arange(n)
     return feat.iloc[inv].reset_index(drop=True)

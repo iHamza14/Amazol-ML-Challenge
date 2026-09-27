@@ -36,6 +36,8 @@ from france_filter import apply_france_filter
 log = logging.getLogger('inference')
 
 KEEP_PROB = cfg.DECISION_KEEP_PROB
+# optional per-entity cap on the pruned candidate set (0 = off): ER_PRUNE_TOPK=40
+PRUNE_TOPK = int(os.environ.get('ER_PRUNE_TOPK', '0') or 0)
 
 
 def load_models(model_dir):
@@ -57,10 +59,12 @@ def predict_models(models, X):
     """Per-model probabilities (dict name -> float32 array)."""
     out = {}
     for k, m in models.items():
+        # explicit thread counts: env.sh sets OMP_NUM_THREADS=1 (for the forked feature workers), and LightGBM's
+        # predict falls back to it when num_threads is not passed -> single-threaded (measured 37 min for 12.7M rows)
         if k == 'lgbm':
-            out[k] = m.predict(X).astype(np.float32)
+            out[k] = m.predict(X, num_threads=cfg.N_JOBS).astype(np.float32)
         else:
-            out[k] = m.predict_proba(X)[:, 1].astype(np.float32)
+            out[k] = m.predict_proba(X, thread_count=cfg.N_JOBS)[:, 1].astype(np.float32)
     return out
 
 
@@ -202,8 +206,18 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
                 continue
             n_retrieved += len(cand)
             if pruner is not None:
-                s_pr = pruner.predict(cand[pr_cols].values.astype(np.float32))
+                s_pr = pruner.predict(cand[pr_cols].values.astype(np.float32), num_threads=cfg.N_JOBS)
                 keep_pr = s_pr >= pr_thr.get(str(country), pr_default)
+                if PRUNE_TOPK > 0:
+                    # per-entity cap: keep only the PRUNE_TOPK highest pruner scores of each S1 (chunks hold every
+                    # candidate of an S1, so the rank is exact); cost measured by prune_cap_eval.py
+                    s1v = cand['s1_pos'].values
+                    o = np.lexsort((-s_pr, s1v))
+                    so = s1v[o]
+                    st_ = np.r_[0, np.flatnonzero(np.diff(so)) + 1]
+                    rk = np.empty(len(so), dtype=np.int64)
+                    rk[o] = np.arange(len(so)) - np.repeat(st_, np.diff(np.r_[st_, len(so)]))
+                    keep_pr &= rk < PRUNE_TOPK
                 cand = cand.loc[keep_pr].reset_index(drop=True)
                 log.info(f"  pruner kept {int(keep_pr.sum()):,} of {len(keep_pr):,} retrieved pairs ({100 * keep_pr.mean():.1f}%)")
                 if len(cand) == 0:

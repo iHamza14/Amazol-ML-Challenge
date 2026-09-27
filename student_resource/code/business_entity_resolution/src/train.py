@@ -417,7 +417,7 @@ def model_and_decision(st):
     if reuse:
         booster = lgb.Booster(model_file=lgbm_path)
         log.info(f"  ER_REUSE_MODELS=1: loaded {lgbm_path} ({booster.num_trees()} trees); model training skipped")
-        p_va = booster.predict(X_va)
+        p_va = booster.predict(X_va, num_threads=cfg.N_JOBS)
     else:
         dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, feature_name=feat_cols, free_raw_data=False)
         dval = lgb.Dataset(X_va, label=y_va, reference=dtrain, free_raw_data=False)
@@ -429,14 +429,14 @@ def model_and_decision(st):
                             'split': booster.feature_importance('split')}).sort_values('gain', ascending=False)
         imp.to_csv(os.path.join(cfg.MODEL_DIR, 'feature_importance.csv'), index=False)
         log.info("  top-25 features by gain:\n" + imp.head(25).to_string(index=False))
-        p_va = booster.predict(X_va, num_iteration=booster.best_iteration)
+        p_va = booster.predict(X_va, num_iteration=booster.best_iteration, num_threads=cfg.N_JOBS)
     probs = {'lgbm': p_va}
 
     if cfg.USE_CATBOOST and reuse and os.path.exists(cb_path):
         from catboost import CatBoostClassifier
         cb = CatBoostClassifier()
         cb.load_model(cb_path)
-        probs['catboost'] = cb.predict_proba(X_va)[:, 1]
+        probs['catboost'] = cb.predict_proba(X_va, thread_count=cfg.N_JOBS)[:, 1]
         log.info(f"  ER_REUSE_MODELS=1: loaded {cb_path}")
     elif cfg.USE_CATBOOST:
         from catboost import CatBoostClassifier
@@ -452,7 +452,7 @@ def model_and_decision(st):
                 cb = CatBoostClassifier(**params)
                 cb.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=(X_va, y_va), use_best_model=True)
                 cb.save_model(os.path.join(cfg.MODEL_DIR, 'catboost.cbm'))
-                probs['catboost'] = cb.predict_proba(X_va)[:, 1]
+                probs['catboost'] = cb.predict_proba(X_va, thread_count=cfg.N_JOBS)[:, 1]
                 break
             except Exception as e:  # noqa
                 log.warning(f"CatBoost ({params['task_type']}) failed: {e}")
@@ -478,7 +478,7 @@ def model_and_decision(st):
             pruner = lgb.train(dict(cfg.PRUNER_PARAMS), dpr, num_boost_round=cfg.PRUNER_ROUNDS)
             pruner.save_model(pruner_path)
             del dpr
-        pruner_score_va = pruner.predict(X_va[:, mi]).astype(np.float32)
+        pruner_score_va = pruner.predict(X_va[:, mi], num_threads=cfg.N_JOBS).astype(np.float32)
         va_country = meta_va['country'].values.astype(str)
         thr, stats = {}, {}
         for c in pd.unique(va_country):

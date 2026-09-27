@@ -616,6 +616,18 @@ def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, 
     import platform
     import multiprocessing as mp
     n = len(cand)
+    # memory-aware pool size: parent RSS + n_workers * FEATURE_WORKER_GB must stay under the RAM limit
+    # (the parent holds ~20-25 GB of frames on the full data; a 9-worker pool on a 50 GB pod is an OOM kill)
+    try:
+        import config as cfg
+        if cfg.TOTAL_RAM_GB > 0:
+            free = cfg.TOTAL_RAM_GB - cfg.rss_gb() - cfg.FEATURE_RAM_HEADROOM_GB
+            allowed = max(1, int(free / cfg.FEATURE_WORKER_GB))
+            if allowed < n_jobs:
+                log.info(f"  feature workers capped {n_jobs} -> {allowed} (rss {cfg.rss_gb():.1f} GB of {cfg.TOTAL_RAM_GB:.0f} GB)")
+                n_jobs = allowed
+    except Exception:  # noqa
+        pass
     if n_jobs <= 1 or n < min_pairs or platform.system() != 'Linux':
         return compute_features(cand, df_s1, df_s23, vecs=vecs, extra_stats=extra_stats)
     s1p = cand['s1_pos'].values

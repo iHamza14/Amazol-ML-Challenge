@@ -176,6 +176,8 @@ def main():
     df_s1 = preprocess_dataframe(df_s1, translit=trans, seg_vocab=seg, n_jobs=cfg.N_JOBS)
     # how many S1 entities of the same country share the core name (name ambiguity signal)
     df_s1['name_dup'] = df_s1.groupby(['country_norm', 'name_core'])['entity_id'].transform('size').astype(np.int32)
+    df_s1 = df_s1.drop(columns=['business_name', 'business_address', 'country'])   # raw text no longer needed
+    gc.collect()
     s1_pos_of_id = pd.Series(np.arange(len(df_s1)), index=df_s1['entity_id'].values)
     # owner of each S2/S3 id -> S1 position ; true-match counts per S1 position
     owner = {}
@@ -240,6 +242,9 @@ def main():
             # how many S1 entities of the country carry exactly this record's core name (chain / ambiguity signal)
             core_counts = df_s1.loc[s1_country == country, 'name_core'].value_counts()
             df_c['s1_core_count'] = df_c['name_core'].map(core_counts).fillna(0).astype(np.int32)
+            df_c = df_c.drop(columns=['business_name', 'business_address', 'country'])   # raw text no longer needed
+            gc.collect()
+            log.info(f"  parent RSS after preprocessing {country}: {cfg.rss_gb():.1f} GB (limit {cfg.TOTAL_RAM_GB:.0f} GB)")
             preprocessed_s23[country] = df_c
         return preprocessed_s23[country]
 
@@ -247,10 +252,11 @@ def main():
     # (~600 B/row -> ~6 GB for the full data): saves one full preprocessing per country
     auto_cache = '1' if (len(df_s23_raw) < 4_000_000 or cfg.TOTAL_RAM_GB >= 45) else '0'
     keep_s23_cached = os.environ.get('ER_CACHE_S23', auto_cache) == '1'
-    # with the S2/S3 frames cached, the per-country Blocker (5 vocabulary fits + reverse product) is built once
-    # and reused between Pass A and Pass B+C
-    blocker_cache = {} if keep_s23_cached else None
-    log.info(f"  S2/S3 + Blocker cache between passes: {keep_s23_cached} (rows={len(df_s23_raw):,}, ram={cfg.TOTAL_RAM_GB:.0f} GB)")
+    # the per-country Blocker (5 vocabulary fits + the ~minutes reverse product) is always built once and reused
+    # between Pass A and Pass B+C (~3 GB per country, dropped after its Pass B+C); re-preprocessing the S2/S3
+    # frame instead is cheap (~3 min per country), so the frame itself is cached only when RAM allows
+    blocker_cache = {}
+    log.info(f"  S2/S3 frame cache between passes: {keep_s23_cached} (rows={len(df_s23_raw):,}, ram={cfg.TOTAL_RAM_GB:.0f} GB); Blocker cache: on")
 
     # ---------- Pass A (all countries first): extra-token statistics + blocking recall ----------
     for country in countries:

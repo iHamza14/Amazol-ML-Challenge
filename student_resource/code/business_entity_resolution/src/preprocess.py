@@ -576,10 +576,18 @@ def preprocess_dataframe(df, translit=None, seg_vocab=None, n_jobs=1, chunk_size
             results.append(_process_chunk(ch))
             if (i + 1) % 20 == 0:
                 log.info(f"  preprocessed {min((i + 1) * chunk_size, n):,}/{n:,}")
+    import sys
+    intern = sys.intern
     for c in NAME_COLS + ADDR_COLS + ['name_tokens']:
         vals = []
         for r in results:
             vals.extend(r[c])
+        if c in ('name_tokens', 'addr_tokens', 'addr_words', 'nums'):
+            # one str object per distinct token instead of one per occurrence (~1M distinct vs ~75M
+            # occurrences on 6M rows): saves several GB and makes forked workers dirty fewer pages
+            for lst in vals:
+                if lst:
+                    lst[:] = [intern(t) for t in lst]
         df[c] = vals
     for c in ('is_domain', 'has_dba', 'name_script', 'n_components', 'legal_code'):
         df[c] = df[c].astype(np.int8)

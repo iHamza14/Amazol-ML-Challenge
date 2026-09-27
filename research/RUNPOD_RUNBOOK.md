@@ -60,6 +60,24 @@ Same as SAGEMAKER_RUNBOOK.md section 4, plus: `ER_RESUME=1` (restart at the mode
 `ER_CHECKPOINT=0` (do not write the ~15 GB checkpoint), `ER_GPU=0/1` (force CatBoost device),
 `ER_CATBOOST_CPU_ITERS` (fallback iterations), `ER_N_JOBS` (pin CPU count).
 
+## 5b. Incident: BrokenPipeError in ForkPoolWorker-* after "chunk 1/4: 20,000 S1 -> 2,000,000 candidates"
+Workers print `BrokenPipeError` when the parent that owns their result pipe has died — i.e. the parent was
+OOM-killed during the feature stage (`dmesg | tail -20` shows `Out of memory: Killed process ... python`).
+Root cause: the parent held ~25 GB of Python-object frames (6.2M-row US S2/S3 frame ~11 GB + its raw copy,
+2.2M-row S1 frame, raw 10.3M-row S2/S3 frame, Blocker matrices) and every forked worker adds its own working
+set plus copy-on-write pages. Fixed in commit after `54d7e0f`: token strings interned (one object per distinct
+token), raw text columns dropped after preprocessing, feature chunks halved (10k S1), the worker pool capped
+by `TOTAL_RAM_GB - parent RSS - 6 GB` / 2.5 GB, RAM limit read from the cgroup (not the host), the reverse
+product pruned of common tokens (19 min -> minutes per country) and the Blocker reused between passes.
+Watch the new log lines `parent RSS after preprocessing ...` and `feature workers capped N -> M`.
+
+Before re-running, check what the container really gives you:
+```bash
+cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max 2>/dev/null; nproc; free -g | head -2; dmesg | tail -5
+```
+If `cpu.max` shows `400000 100000` the pod really has 4 CPUs (the log's `jobs=4`); otherwise set
+`ER_N_JOBS=9` in `/workspace/env.sh`. If `memory.max` is not 50 GB, the config line's `ram=` must match it.
+
 ## 6. Warnings
 - **Pod restart wipes pip packages**: re-run `setup_runpod.sh --no-smoke` (2 min), then `source /workspace/env.sh`.
 - **Do not run two trainings at once** on 50 GB.

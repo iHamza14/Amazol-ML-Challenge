@@ -215,8 +215,23 @@ class Blocker:
         self.n_s1c = len(s1_df_country)
         if A.nnz == 0:
             return
-        C = sp_matmul_topn(X_joint, A.T.tocsr(), top_n=k, threshold=cfg.BLOCK_MIN_SCORE, sort=True,
+        # prune common tokens from both sides: they never decide a record's best S1 but their long posting
+        # lists dominate the S2/S3 x S1 product (19 min -> minutes per country)
+        df_cols = np.diff(X_joint.tocsc().indptr)
+        keep_col = df_cols <= max(50, int(cfg.REVERSE_MAX_DF_FRAC * X_joint.shape[0]))
+        if not keep_col.all():
+            D = sp.diags(keep_col.astype(np.float32))
+            Xr = (X_joint @ D).tocsr()
+            Ar = (A @ D).tocsr()
+            Xr.eliminate_zeros()
+            Ar.eliminate_zeros()
+            log.info(f"    reverse channel: {int((~keep_col).sum()):,} common tokens pruned "
+                     f"({X_joint.nnz:,} -> {Xr.nnz:,} nnz on the S2/S3 side)")
+        else:
+            Xr, Ar = X_joint, A
+        C = sp_matmul_topn(Xr, Ar.T.tocsr(), top_n=k, threshold=cfg.BLOCK_MIN_SCORE, sort=True,
                            n_threads=self.n_threads)
+        del Xr, Ar
         C = C.tocoo()
         if C.nnz == 0:
             return

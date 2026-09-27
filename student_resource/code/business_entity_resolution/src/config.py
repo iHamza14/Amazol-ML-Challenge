@@ -63,9 +63,32 @@ def _detect_cpus():
 
 
 def _total_ram_gb():
+    """RAM available to this process: min(physical, cgroup limit). Inside a container /proc/meminfo shows the
+    HOST's memory (hundreds of GB) while the cgroup limit (e.g. 50 GB on RunPod) is what the OOM killer enforces."""
+    ram = 0.0
     try:
-        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024 ** 3
+        ram = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024 ** 3
     except (AttributeError, ValueError, OSError):
+        pass
+    for path in ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+            if v.isdigit() and int(v) < (1 << 60):
+                lim = int(v) / 1024 ** 3
+                ram = min(ram, lim) if ram else lim
+        except OSError:
+            continue
+    return ram
+
+
+def rss_gb():
+    """Resident memory of the current process in GB (Linux; 0.0 elsewhere)."""
+    try:
+        with open('/proc/self/statm') as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf('SC_PAGE_SIZE') / 1024 ** 3
+    except (OSError, ValueError, AttributeError, IndexError):
         return 0.0
 
 
@@ -133,7 +156,15 @@ BLOCK_MAX_DF_FRAC = 0.03         # drop tokens present in > 3% of S23 docs of th
 # Keep train == inference.
 BLOCK_MAX_CANDIDATES = int(os.environ.get('ER_MAX_CANDIDATES', 100))
 BLOCK_MAX_CANDIDATES_INFER = BLOCK_MAX_CANDIDATES
-BLOCK_S1_CHUNK = 20000           # S1 rows per sparse matmul chunk (memory bound)
+BLOCK_S1_CHUNK = 10000           # S1 rows per sparse matmul / feature chunk (bounds per-worker memory: ~1M pairs)
+# Reverse product (S2/S3 x all S1 of the country): tokens present in more than this fraction of S2/S3 rows are
+# dropped from BOTH sides before the product. Common tokens never decide a record's best S1 but dominate the
+# cost (posting lists of 100k+ rows); measured 19 min per country without pruning on 4 threads.
+REVERSE_MAX_DF_FRAC = float(os.environ.get('ER_REVERSE_MAX_DF', 0.005))
+# forked feature workers: each needs roughly this much RAM (own working set for ~1M/N pairs + copy-on-write
+# pages of the parent it touches); the pool size is capped so that parent + workers stay under TOTAL_RAM_GB
+FEATURE_WORKER_GB = 2.5
+FEATURE_RAM_HEADROOM_GB = 6.0
 # Reverse channel: every S2/S3 record retrieves its top-k S1 entities (joint vector); the S1's rank in that
 # list is a competition feature and each record's top-1 S1 becomes an extra candidate. Costs one extra
 # sparse product per country (S2/S3 x all S1). Disable with ER_REVERSE=0.

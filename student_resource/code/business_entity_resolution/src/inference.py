@@ -121,6 +121,8 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
     gc.collect()
     df_s1 = preprocess_dataframe(df_s1, translit=trans, seg_vocab=seg, n_jobs=cfg.N_JOBS)
     df_s1['name_dup'] = df_s1.groupby(['country_norm', 'name_core'])['entity_id'].transform('size').astype(np.int32)
+    df_s1 = df_s1.drop(columns=['business_name', 'business_address', 'country'])   # raw text no longer needed
+    gc.collect()
     df_s23_raw['country_norm'] = df_s23_raw['country'].map(lambda x: str(x).lower().strip())
     s1_ids = df_s1['entity_id'].values
     s1_country = df_s1['country_norm'].values
@@ -165,6 +167,9 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
         df_s23_c = preprocess_dataframe(df_s23_c, translit=trans, seg_vocab=seg, n_jobs=cfg.N_JOBS)
         core_counts = df_s1.loc[s1_country == country, 'name_core'].value_counts()
         df_s23_c['s1_core_count'] = df_s23_c['name_core'].map(core_counts).fillna(0).astype(np.int32)
+        df_s23_c = df_s23_c.drop(columns=['business_name', 'business_address', 'country'])   # raw text no longer needed
+        gc.collect()
+        log.info(f"  parent RSS after preprocessing {country}: {cfg.rss_gb():.1f} GB (limit {cfg.TOTAL_RAM_GB:.0f} GB)")
         s23_ids_c = df_s23_c['entity_id'].values
         mask_c = s1_country == country
         n_pairs = 0

@@ -46,6 +46,8 @@ def main():
     ap.add_argument('--france-max-raise', type=float, default=None, help='override the calibration max raise')
     ap.add_argument('--no-validate', action='store_true')
     a = ap.parse_args()
+    if a.france_threshold is not None and a.france_shift:
+        ap.error('--france-shift applies to the calibrated threshold; give either --france-threshold or --france-shift')
     t0 = time.time()
     output_dir = a.output_dir or cfg.OUTPUT_DIR
     model_dir = a.model_dir or cfg.MODEL_DIR

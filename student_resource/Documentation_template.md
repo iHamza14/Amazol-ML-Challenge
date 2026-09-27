@@ -15,9 +15,11 @@ from the provided data, with no external lookup of any kind:
    neighbours per S1 entity with multi-threaded sparse matrix products; a reverse channel lets every
    S2/S3 record nominate its best S1 owners. Reciprocal-rank fusion orders the union and caps it at
    150 (US, France) or 200 (India). A **stage-2 pruner** (a small gradient-boosted model over the 16
-   retrieval scores and ranks, which cost nothing extra) then drops the hopeless pairs at a threshold
-   set to keep 99.9 % of the retrieved true matches on validation. The survivors are exactly the
-   pairs the matching model scores and the content of `candidate_pairs.tsv`.
+   retrieval scores and ranks, which cost nothing extra) then scores every retrieved pair; each S1
+   entity keeps at most its **20 best-scored** pairs above a per-country threshold (set to keep 99.9 %
+   of the retrieved true matches on validation). The survivors — about **20 candidates per S1 entity**,
+   down from 150–200 retrieved — are exactly the pairs the matching model scores and the content of
+   `candidate_pairs.tsv`.
 2. **A LightGBM + CatBoost pair classifier** over 124 noise-aware features, trained on 300 k S1
    entities searched against the full S2/S3 pools of their countries.
 3. **An entity-level decision layer** that directly optimises the competition metric (macro F0.5 per
@@ -110,12 +112,30 @@ fused rank and the reverse rank/score — 16 numbers that cost nothing extra. A 
 the largest value that keeps **99.9 % of the retrieved true matches on the validation split** — drops
 the hopeless pairs before any string comparison is made. The survivors are the candidate set: the exact
 pairs the matching model computes its 124 features for and scores, and the content of
-`output/candidate_pairs.tsv`. This stage cuts the pairs the matching model sees by roughly an order of
-magnitude at a measured recall cost of 0.1 % of the reachable matches.
+`output/candidate_pairs.tsv`. On the validation split the threshold alone kept 47.1 candidates per S1
+entity in the US (of 150 retrieved) and 129.9 in India (of 200), at 99.90 % of the retrieved true
+matches. A **per-entity cap** then keeps only the 20 highest pruner scores of each S1. Its cost was
+measured end to end on the 75 000 validation entities by removing the selected pairs that fall outside
+the cap (`prune_cap_eval.py`):
 
-- **Candidates per S1 entity:** [from inference log: `retrieved N/S1 -> candidates scored M/S1`, per country]
-- **Recall on a held-out training split:** [from train log: `BLOCKING RECALL at the shipped cap` per country;
-  `pruner <country>: threshold ... keeps 0.999 of retrieved true matches`]
+| cap per S1 | candidates per S1 (US / India) | adjusted macro-F0.5 | change |
+|---|---|---|---|
+| 10 | 10.0 / 10.0 | 0.98053 | −0.00141 |
+| 20 (**shipped**) | 19.9 / 20.0 | 0.98133 | −0.00061 |
+| 40 | 36.3 / 40.0 | 0.98170 | −0.00024 |
+| 80 | 46.3 / 80.0 | 0.98188 | −0.00006 |
+| none (threshold only) | 47.1 / 129.9 | 0.98194 | 0 |
+
+The cap of 20 was chosen as the operating point that keeps the candidate set small (the organizers rank
+smaller candidate sets higher) and the full test set within one machine's time budget, at a cost of
+0.0006 F0.5. On the test set: 1 732 544 S1 entities × at most 20 = about 34.6 M scored pairs, from
+about 280 M retrieved.
+
+- **Candidates per S1 entity (test):** at most 20; about 20 on average (validation: US 19.9, India 20.0;
+  France uses the lowest seen threshold and the same cap).
+- **Recall on a held-out training split (60 000 entities, final run):** retrieval within the cap
+  0.99240 (US, cap 150) and 0.98709 (India, cap 200); the pruner threshold keeps 0.99899 (US) and 0.99900
+  (India) of the retrieved true matches.
 - **How true matches are not lost:** name and address channels are unioned (only 0.02 % of true
   pairs share neither a name nor an address token), the Indic transliteration and domain-name
   segmentation make otherwise token-less names retrievable, the character-3-gram channel covers
@@ -205,14 +225,28 @@ inference alike.
 ## 5. Results & Error Analysis
 
 - **F_0.5 Score (macro), final run (300 000 training entities, 75 000 validation entities searched
-  against the full S2/S3 pools):** [from train log: `VAL macro-F0.5 plain = ... | density-adjusted = ...`,
-  with the per-country values].
+  against the full S2/S3 pools):** **0.98271 plain / 0.98194 density-adjusted** (US 0.98461 / 0.98393,
+  India 0.97988 / 0.97896) with the threshold-only candidate set; with the shipped cap of 20 candidates
+  per entity 0.98210 plain / 0.98133 density-adjusted. The density-adjusted number weights false
+  positives on distractor rows 1.9x to mirror the test pool and is our estimate of the leaderboard
+  score for US and India; France has no labels.
+- **Models (validation pairs, 12.7 M):** LightGBM log-loss 0.00199, AUC 0.999954 (best iteration 1 257);
+  CatBoost log-loss 0.00216, AUC 0.999945 (3 998 iterations, GPU); ensemble log-loss 0.00202, AUC
+  0.999952. Training matrix: 22.7 M pairs, 1.03 M positives. Most important features by gain: summed
+  retrieval score, fused rank, reverse-channel rank, first-house-number relation, learned inserted-word
+  statistic, normalised-name ratio, admin-unit relation, address token-set ratio.
+- **Selected decision layer:** mean of the two models; thresholds US 0.71 (address present) / 0.74
+  (address empty), India 0.75 / 0.69; rank ladder deltas −0.05 / +0.05 / +0.05 for the 2nd / 3rd / 4th+
+  link (0.98183 → 0.98194 adjusted); one-owner conflict rule on. Not adopted because they scored lower:
+  expected-F0.5 set selection (0.98108), the minimum-of-models consensus (0.98145), and the address-empty
+  unique-claimant rule (no threshold improved the score). France starts at 0.75 and is calibrated
+  upward on the test set as described in section 4.
 - **Blocking recall at the shipped cap, final run (60 000 held-out entities):** US 0.99240 (cap 150),
   India 0.98709 (cap 200). With the previous settings (top-k 60/40/60/40/80, min-rank fusion, cap 100)
   the same measurement gave 0.99185 and 0.97593: the retrieval upgrade recovered 1.1 % of India's true
   matches, which no downstream stage could otherwise reach.
-- **Candidate set:** [from inference log, per country: `retrieved N pairs (x/S1) -> candidates scored M
-  (y/S1)`] and pruner recall on validation [from train log: `pruner <country>: ... keeps 0.999`].
+- **Candidate set:** about 20 candidates per S1 entity after the two-stage cascade (150–200 retrieved,
+  then pruned and capped), see section 3.
 - **Public leaderboard:** [..]
 - **Reference run with 20 000 training entities (same full-scale pools, previous retrieval settings):**
   0.97560 plain / 0.97391 density-adjusted (US 0.97877 / 0.97742, India 0.97067 / 0.96843); ensemble

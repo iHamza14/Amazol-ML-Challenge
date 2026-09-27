@@ -19,14 +19,16 @@ export DATA_ROOT=/path/to/dataset           # contains train/ and test/ (case-in
 export PROJECT_ROOT=/path/for/models_cache_output   # models/, cache/, output/ are created here
 export ER_N_JOBS=16                         # CPU count; set it explicitly inside containers that report the host's cores
 cd src
-ER_SAMPLE_S1=300000 ER_STATS_S1=60000 python train.py     # ~1.5 h on 16 vCPU + GPU: writes $PROJECT_ROOT/models/*
-python inference.py                                        # ~4 h on the full test set: writes $PROJECT_ROOT/output/
+ER_SAMPLE_S1=300000 ER_STATS_S1=60000 python train.py     # ~3 h on 16 vCPU + GPU: writes $PROJECT_ROOT/models/*
+python prune_cap_eval.py --finish-by-utc HH:MM             # optional: measures the candidate-cap trade-off (2 min)
+ER_PRUNE_TOPK=20 python inference.py                       # ~3.2 h on the full test set: writes $PROJECT_ROOT/output/
                                                            # matching_results.tsv, candidate_pairs.tsv, scored_pairs.parquet
                                                            # and runs utils/validate_submission.py on the matching file
 ```
 
 The submitted run used exactly these settings (300 000 training entities, 60 000 statistics entities, 75 000
-validation entities, each searched against the full S2/S3 pool of its country).
+validation entities, each searched against the full S2/S3 pool of its country; inference with a cap of 20
+candidates per S1 entity, `ER_PRUNE_TOPK=20`).
 
 After the feature stage `train.py` writes a checkpoint (`cache/train_state`); `ER_RESUME=1 python train.py`
 restarts at the model stage, and `ER_RESUME=1 ER_REUSE_MODELS=1 python train.py` re-runs only the pruner and

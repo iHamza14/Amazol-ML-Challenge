@@ -677,14 +677,14 @@ class _WorkerMemProbe(threading.Thread):
         super().__init__(daemon=True)
         self.pids = list(pids)
         self.peak = 0.0
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()      # NOT '_stop': threading.Thread uses that name internally
 
     def run(self):
-        while not self._stop.wait(1.0):
+        while not self._stop_evt.wait(1.0):
             self.peak = max(self.peak, _workers_private_gb(self.pids))
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
         self.join(timeout=5)
         self.peak = max(self.peak, _workers_private_gb(self.pids))
         return self.peak
@@ -745,11 +745,20 @@ def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, 
     probe = None
     try:
         with ctx.Pool(n_workers, initializer=_par_init, initargs=(vecs, extra_stats)) as pool:
-            if platform.system() == 'Linux':
+            # the probe is instrumentation only: it must never be able to fail the feature stage
+            try:
                 probe = _WorkerMemProbe([p.pid for p in pool._pool])
                 probe.start()
+            except Exception as e:  # noqa
+                log.warning(f"  worker memory probe unavailable: {e}")
+                probe = None
             feats = list(pool.imap(_par_work, tasks))          # ordered; results stream back as parts finish
-            peak = probe.stop() if probe is not None else 0.0
+            peak = 0.0
+            if probe is not None:
+                try:
+                    peak = float(probe.stop())
+                except Exception as e:  # noqa
+                    log.warning(f"  worker memory probe failed: {e}")
     finally:
         gc.unfreeze()
     feat = pd.concat(feats, ignore_index=True)

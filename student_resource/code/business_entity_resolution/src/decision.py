@@ -118,9 +118,9 @@ def decide(s1_code, s23_code, prob, country, cfg_dec):
     else:
         mask = threshold_select(prob, country, cfg_dec.get('thresholds') or {}, cfg_dec.get('default_threshold', 0.5))
     delta = float(cfg_dec.get('extra_link_delta', 0.0) or 0.0)
-    if delta > 0:
+    if delta != 0:
         t_pair = pair_thresholds(country, cfg_dec.get('thresholds') or {}, cfg_dec.get('default_threshold', 0.5))
-        mask = size_adaptive(s1_code, prob, mask, t_pair + delta)
+        mask = size_adaptive(s1_code, prob, mask, t_pair + delta, relax=delta < 0)
     if cfg_dec.get('resolve_conflicts', True):
         mask = resolve_conflicts(s1_code, s23_code, prob, mask)
     return mask
@@ -135,7 +135,7 @@ def pair_thresholds(group, thresholds, default):
     return t
 
 
-def size_adaptive(s1_code, prob, mask, floor):
+def size_adaptive(s1_code, prob, mask, floor, relax=False):
     """
     Size-adaptive acceptance (Foursquare 4th place post-processing, adapted to F0.5): within an entity the
     best selected candidate is always kept; every further selected candidate must satisfy
@@ -145,6 +145,13 @@ def size_adaptive(s1_code, prob, mask, floor):
     idx = np.flatnonzero(mask)
     if len(idx) == 0:
         return mask
+    if relax:
+        # negative delta: an entity whose best candidate passed its threshold is a confirmed non-singleton, so
+        # its further candidates are accepted at the LOWER floor (threshold + delta, delta < 0). Missed links
+        # were 66% of the validation loss; only entities with an accepted anchor are relaxed.
+        anchored = np.zeros(int(s1_code.max()) + 1, dtype=bool)
+        anchored[s1_code[idx]] = True
+        return mask | (anchored[s1_code] & (prob >= floor))
     order = idx[np.lexsort((-prob[idx], s1_code[idx]))]
     s = s1_code[order]
     p = prob[order]

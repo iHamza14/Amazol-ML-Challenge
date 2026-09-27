@@ -278,7 +278,11 @@ DECISION_KEEP_PROB = 0.02                # pairs below this max-model probabilit
 RESOLVE_S23_CONFLICTS = True             # each S2/S3 record belongs to at most one S1 entity
 USE_EXPECTED_F05 = True                  # compare threshold rule vs expected-F0.5 set selection on val
 USE_CONSENSUS = True                     # also evaluate min(model probs) instead of the mean (precision filter)
-EXTRA_LINK_DELTA_GRID = [0.0, 0.05, 0.10, 0.15]   # size-adaptive acceptance: 2nd+ links need prob >= floor + delta
+# size-adaptive acceptance: 2nd+ links of an entity need prob >= threshold + delta. Positive deltas tighten
+# (Foursquare-style); NEGATIVE deltas relax: once an entity's best candidate passed its threshold it is a confirmed
+# non-singleton and its further candidates are accepted at the lower bar (missed links were 66% of the validation
+# loss in the 20k run, and tightening lost 0.0003). Selected on validation like every other decision option.
+EXTRA_LINK_DELTA_GRID = [-0.30, -0.25, -0.20, -0.15, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15]
 
 # ============================================================
 # Experiments (all off by default)

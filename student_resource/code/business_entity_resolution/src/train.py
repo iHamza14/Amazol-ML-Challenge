@@ -532,8 +532,8 @@ def model_and_decision(st):
             best = cand_best
         # size-adaptive acceptance: 2nd+ links of an entity need prob >= entity floor + delta
         t_pair = pair_thresholds(group_pair, thresholds, t_glob)
-        for delta in [d for d in cfg.EXTRA_LINK_DELTA_GRID if d > 0]:
-            m_sa = size_adaptive(s1_code, P, m_thr, t_pair + delta)
+        for delta in [d for d in cfg.EXTRA_LINK_DELTA_GRID if d != 0]:
+            m_sa = size_adaptive(s1_code, P, m_thr, t_pair + delta, relax=delta < 0)
             if use_rc:
                 m_sa = resolve_conflicts(s1_code, s23_code, P, m_sa)
             f_sa, _ = score_mask(m_sa)

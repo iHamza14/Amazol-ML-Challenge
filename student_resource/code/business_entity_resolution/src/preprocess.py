@@ -516,8 +516,31 @@ ADDR_COLS = ['addr_norm', 'street', 'admin', 'postal', 'nums', 'first_num', 'ran
 
 def _init_worker(trans_table, seg_logp):
     global _TRANS, _SEG
+    import gc
+    # forked child: a garbage collection would walk every container inherited from the parent (millions of token
+    # lists on the full data) and copy their pages; measured 1.0-1.7 GB per worker growing with the parent, 43.7 of
+    # 47 GB at peak on the pod. The child only creates short-lived per-chunk objects, so collection is not needed.
+    gc.disable()
     _TRANS = Transliterator(trans_table) if trans_table is not None else None
     _SEG = SegVocab(seg_logp) if seg_logp is not None else None
+
+
+PREPROCESS_WORKER_GB = 1.5       # budget per forked preprocessing worker (its 50k-row chunk in and out)
+
+
+def _preprocess_pool_size(n_jobs):
+    """Workers allowed by the RAM budget (same rule as the feature pool): parent + workers + headroom <= limit."""
+    try:
+        import config as cfg
+        if cfg.TOTAL_RAM_GB > 0:
+            rss = cfg.rss_gb()
+            allowed = max(1, int((cfg.TOTAL_RAM_GB - rss - cfg.FEATURE_RAM_HEADROOM_GB) / PREPROCESS_WORKER_GB))
+            if allowed < n_jobs:
+                log.info(f"  preprocessing workers capped {n_jobs} -> {allowed} (parent rss {rss:.1f} GB of {cfg.TOTAL_RAM_GB:.0f} GB)")
+                return allowed
+    except Exception:  # noqa
+        pass
+    return n_jobs
 
 
 def _process_chunk(args):
@@ -564,12 +587,19 @@ def preprocess_dataframe(df, translit=None, seg_vocab=None, n_jobs=1, chunk_size
     trans_table = translit.table if translit is not None else None
     seg_logp = seg_vocab.logp if seg_vocab is not None else None
     results = []
+    n_jobs = _preprocess_pool_size(n_jobs) if n_jobs > 1 else n_jobs
     if n_jobs > 1 and len(chunks) > 1:
-        with mp.Pool(min(n_jobs, len(chunks)), initializer=_init_worker, initargs=(trans_table, seg_logp)) as pool:
-            for i, r in enumerate(pool.imap(_process_chunk, chunks)):
-                results.append(r)
-                if (i + 1) % 20 == 0:
-                    log.info(f"  preprocessed {min((i + 1) * chunk_size, n):,}/{n:,}")
+        import gc
+        gc.collect()
+        gc.freeze()      # parent heap -> permanent generation: forked children never traverse (and copy) it
+        try:
+            with mp.Pool(min(n_jobs, len(chunks)), initializer=_init_worker, initargs=(trans_table, seg_logp)) as pool:
+                for i, r in enumerate(pool.imap(_process_chunk, chunks)):
+                    results.append(r)
+                    if (i + 1) % 20 == 0:
+                        log.info(f"  preprocessed {min((i + 1) * chunk_size, n):,}/{n:,}")
+        finally:
+            gc.unfreeze()
     else:
         _init_worker(trans_table, seg_logp)
         for i, ch in enumerate(chunks):

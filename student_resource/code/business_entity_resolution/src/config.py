@@ -15,12 +15,59 @@ import platform
 import logging
 import multiprocessing
 
+# BLAS/OpenMP threads: the feature stage forks N_JOBS worker processes; a multi-threaded BLAS inside each
+# would oversubscribe the CPUs. LightGBM / CatBoost / sparse_dot_topn get their thread counts explicitly.
+# (Effective only if set before numpy is imported — setup_runpod.sh also exports it.)
+for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+    os.environ.setdefault(_v, '1')
+
 # ============================================================
 # Environment Detection
 # ============================================================
 IS_SAGEMAKER = os.path.exists('/home/ec2-user/SageMaker')
+IS_RUNPOD = os.path.isdir('/workspace') and not IS_SAGEMAKER
 IS_WINDOWS = platform.system() == 'Windows'
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _detect_cpus():
+    """
+    CPUs actually available to this process. Inside a container `cpu_count()` reports the HOST's cores
+    (e.g. 128 on a RunPod node with a 9-vCPU quota); using it would start 128 LightGBM threads and 128
+    forked feature workers. Order of trust: ER_N_JOBS > cgroup v2/v1 quota > sched affinity > cpu_count.
+    """
+    env = os.environ.get('ER_N_JOBS')
+    if env:
+        return max(1, int(env))
+    n = multiprocessing.cpu_count()
+    try:
+        n = min(n, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    try:
+        with open('/sys/fs/cgroup/cpu.max') as f:          # cgroup v2: "<quota> <period>" or "max <period>"
+            q, p = f.read().split()
+            if q != 'max':
+                n = min(n, max(1, int(int(q) / int(p) + 0.5)))
+    except (OSError, ValueError):
+        try:
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us') as f:   # cgroup v1
+                q = int(f.read())
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us') as f:
+                p = int(f.read())
+            if q > 0:
+                n = min(n, max(1, int(q / p + 0.5)))
+        except (OSError, ValueError):
+            pass
+    return max(1, n)
+
+
+def _total_ram_gb():
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024 ** 3
+    except (AttributeError, ValueError, OSError):
+        return 0.0
+
 
 # ============================================================
 # Paths
@@ -29,6 +76,8 @@ if 'DATA_ROOT' in os.environ:
     DATA_ROOT = os.environ['DATA_ROOT']
 elif IS_SAGEMAKER:
     DATA_ROOT = '/home/ec2-user/SageMaker/dataset'
+elif IS_RUNPOD:
+    DATA_ROOT = '/workspace/dataset'
 elif IS_WINDOWS:
     DATA_ROOT = r'D:\Downloads\Amazol-ML-Challenge\Dataset ML Amazon'
 else:
@@ -60,7 +109,8 @@ CACHE_DIR = os.path.join(PROJECT_ROOT, 'cache')
 # ============================================================
 # Compute
 # ============================================================
-N_JOBS = int(os.environ.get('ER_N_JOBS', max(1, multiprocessing.cpu_count())))
+N_JOBS = _detect_cpus()
+TOTAL_RAM_GB = _total_ram_gb()
 RANDOM_SEED = 42
 
 # ============================================================
@@ -114,8 +164,16 @@ import shutil as _shutil
 HAS_GPU = (os.environ.get('ER_GPU') == '1') or (os.environ.get('ER_GPU') != '0' and _shutil.which('nvidia-smi') is not None)
 CATBOOST_PARAMS = dict(iterations=4000, learning_rate=0.06, depth=8, l2_leaf_reg=3.0,
                        loss_function='Logloss', eval_metric='Logloss', random_seed=RANDOM_SEED,
-                       od_type='Iter', od_wait=150, verbose=200,
+                       od_type='Iter', od_wait=150, verbose=200, thread_count=N_JOBS,
                        task_type='GPU' if HAS_GPU else 'CPU')
+# if GPU training fails (driver/CUDA mismatch), CatBoost is retried on CPU with this many iterations
+# (bounded so the fallback cannot eat the time budget); ER_NO_CATBOOST=1 skips CatBoost entirely
+CATBOOST_CPU_FALLBACK_ITERATIONS = int(os.environ.get('ER_CATBOOST_CPU_ITERS', 1500))
+# training-matrix checkpoint (train.py): matrices + metadata are saved to CACHE_DIR/train_state after the
+# feature stage; ER_RESUME=1 skips straight to model training from that checkpoint (pod restarts, CatBoost
+# crashes, decision-layer re-runs). Disable saving with ER_CHECKPOINT=0.
+CHECKPOINT_MATRICES = os.environ.get('ER_CHECKPOINT', '1') != '0'
+RESUME_FROM_CHECKPOINT = os.environ.get('ER_RESUME', '0') == '1'
 ENSEMBLE_WEIGHTS = {'lgbm': 0.5, 'catboost': 0.5}
 
 # ============================================================
@@ -175,5 +233,8 @@ CROSS_ENCODER_WARMUP = 500
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
-log.info(f"Environment: {'SageMaker' if IS_SAGEMAKER else 'Local ' + platform.system()} | "
-         f"jobs={N_JOBS} | data={DATA_ROOT} | project={PROJECT_ROOT}")
+log.info(f"Environment: {'SageMaker' if IS_SAGEMAKER else 'RunPod' if IS_RUNPOD else 'Local ' + platform.system()} | "
+         f"jobs={N_JOBS} (host cpus={multiprocessing.cpu_count()}) | ram={TOTAL_RAM_GB:.0f} GB | gpu={HAS_GPU} | "
+         f"data={DATA_ROOT} | project={PROJECT_ROOT}")
+if not os.path.isdir(TRAIN_DIR) and not os.path.isdir(TEST_DIR):
+    log.warning(f"Neither {TRAIN_DIR} nor {TEST_DIR} exists — set DATA_ROOT to the folder containing train/ and test/")

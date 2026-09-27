@@ -178,6 +178,25 @@ class SegVocab:
         log.info(f"Segmentation vocabulary: {len(logp):,} words")
         return cls(logp)
 
+    def score(self, s):
+        """Best Viterbi log-prob of s (same scoring as segment(); 0.0 for empty / over-long input)."""
+        n = len(s)
+        if n == 0 or n > 60:
+            return 0.0
+        best = [0.0] + [-1e18] * n
+        lp, unk = self.logp, self.unk
+        for i in range(1, n + 1):
+            bi = -1e18
+            for j in range(max(0, i - self.maxlen), i):
+                w = s[j:i]
+                sc = lp.get(w)
+                if sc is None:
+                    sc = -6.0 if w.isdigit() else unk * (i - j)
+                if best[j] + sc > bi:
+                    bi = best[j] + sc
+            best[i] = bi
+        return best[n]
+
     def segment(self, s):
         """Viterbi segmentation maximising sum of unigram log-probs."""
         n = len(s)
@@ -279,13 +298,18 @@ def normalize_name(raw):
                 is_domain = 1
                 collapsed_seed = m2.group(1).replace('-', '').replace('.', '').replace('_', '')
     if collapsed_seed is not None:
-        if _SEG is not None:
-            # segment first, then repair leetspeak per token (keeps genuine digit runs such as '4528')
-            seg_toks = _SEG.segment(collapsed_seed).split()
-            s = ' '.join(_deleet_token(t) for t in seg_toks)
-            collapsed_seed = s.replace(' ', '')
-        else:
-            s = collapsed_seed
+        if any(ch.isdigit() for ch in collapsed_seed):
+            # leet digits inside a collapsed seed break segmentation before any per-token repair could run
+            # ('cardi0logysafecare'): compare the raw seed with its de-leeted form by segmentation score —
+            # the one the S1 vocabulary explains better wins; a genuine number ('4528mountainview') stays,
+            # because LEET_MAP turns it into an unknown letter run
+            fixed = ''.join(T.LEET_MAP.get(ch, ch) if ch.isdigit() else ch for ch in collapsed_seed)
+            if _SEG is None:
+                if _LEET_TOKEN_RE.match(collapsed_seed):
+                    collapsed_seed = fixed
+            elif _SEG.score(fixed) > _SEG.score(collapsed_seed):
+                collapsed_seed = fixed
+        s = _SEG.segment(collapsed_seed) if _SEG is not None else collapsed_seed
 
     # symbols and punctuation; French elisions (l'atelier -> l atelier) before apostrophes are dropped,
     # English possessives (celestyna's) stay glued

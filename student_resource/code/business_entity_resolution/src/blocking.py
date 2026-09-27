@@ -385,12 +385,15 @@ BLOCK_META_COLS = ['n_channels', 'min_rank', 'sum_score', 'cand_count', 'fused_r
 # ------------------------------------------------------------------
 # Generator over countries and S1 chunks
 # ------------------------------------------------------------------
-def iter_candidate_chunks(df_s1, df_s23, chunk_size=None, max_candidates=None, s1_mask=None):
+def iter_candidate_chunks(df_s1, df_s23, chunk_size=None, max_candidates=None, s1_mask=None, blocker_cache=None):
     """
     Yield (country, candidate_chunk_df, blocker) for every country present in df_s1.
     df_s1 / df_s23 : full preprocessed frames (default RangeIndex). s1_mask optionally restricts the S1 rows
     that are QUERIED; the reverse channel always sees ALL S1 rows of the country (as at test time).
     The blocker exposes .vec (channel -> SparseVectorizer) for exact cosine features.
+    blocker_cache  : optional dict; a Blocker built for a country is stored there and reused by later calls with
+                     the same df_s23 (train.py: Pass A and Pass B+C) — the build (five vocabulary fits + the
+                     reverse S2/S3 x S1 product) does not depend on s1_mask.
     """
     chunk_size = chunk_size or cfg.BLOCK_S1_CHUNK
     s1_country = df_s1['country_norm'].values
@@ -405,10 +408,16 @@ def iter_candidate_chunks(df_s1, df_s23, chunk_size=None, max_candidates=None, s
         if len(s23_pos_all) == 0:
             log.warning(f"  no S2/S3 rows for country {country}; all its S1 entities become singletons")
             continue
-        rev_k = cfg.REVERSE_TOPK if cfg.USE_REVERSE_BLOCKING else 0
-        blocker = Blocker(df_s23.iloc[s23_pos_all], s23_pos_all,
-                          s1_df_country=df_s1.iloc[s1_pos_country] if rev_k else None,
-                          s1_pos_country=s1_pos_country, reverse_k=rev_k)
+        blocker = blocker_cache.get(country) if blocker_cache is not None else None
+        if blocker is not None and blocker.n_s23 == len(s23_pos_all):
+            log.info("  reusing the cached Blocker for this country")
+        else:
+            rev_k = cfg.REVERSE_TOPK if cfg.USE_REVERSE_BLOCKING else 0
+            blocker = Blocker(df_s23.iloc[s23_pos_all], s23_pos_all,
+                              s1_df_country=df_s1.iloc[s1_pos_country] if rev_k else None,
+                              s1_pos_country=s1_pos_country, reverse_k=rev_k)
+            if blocker_cache is not None:
+                blocker_cache[country] = blocker
         n_chunks = math.ceil(len(s1_pos_all) / chunk_size)
         for ci in range(n_chunks):
             pos = s1_pos_all[ci * chunk_size:(ci + 1) * chunk_size]
@@ -416,4 +425,5 @@ def iter_candidate_chunks(df_s1, df_s23, chunk_size=None, max_candidates=None, s
             log.info(f"  chunk {ci + 1}/{n_chunks}: {len(pos):,} S1 -> {len(cand):,} candidates "
                      f"({len(cand) / max(1, len(pos)):.1f}/S1)")
             yield country, cand, blocker
-        del blocker
+        if blocker_cache is None:
+            del blocker

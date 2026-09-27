@@ -21,7 +21,12 @@ python inference.py                         # ~1 h: writes ../../../output/match
                                             # and runs utils/validate_submission.py automatically
 ```
 
-Useful environment variables: `ER_N_JOBS` (worker processes, default all cores), `ER_SAMPLE_S1`
+RunPod: `bash setup_runpod.sh` at the repository root installs everything, verifies the GPU and runs a
+smoke test; see `research/RUNPOD_RUNBOOK.md`. After the feature stage `train.py` writes a checkpoint
+(`cache/train_state`, ~15 GB on the full data); `ER_RESUME=1 python train.py` restarts at the model stage.
+
+Useful environment variables: `ER_N_JOBS` (worker processes; auto-detected from the cgroup CPU quota inside
+containers, default all cores), `ER_SAMPLE_S1`
 (number of S1 entities used for training pairs; default 400000; e.g. 100000 for a 30-40 min run),
 `ER_MAX_CANDIDATES` (candidate cap per S1, default 100, identical for train and inference),
 `ER_NO_CATBOOST=1` (LightGBM only), `ER_FRANCE_FILTER=1` (enable the street-support filter for unseen

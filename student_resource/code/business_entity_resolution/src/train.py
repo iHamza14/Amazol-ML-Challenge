@@ -105,6 +105,34 @@ def subsample_negatives(label, fused_rank, rng):
 # ------------------------------------------------------------------
 # main
 # ------------------------------------------------------------------
+STATE_DIR = os.path.join(cfg.CACHE_DIR, 'train_state')
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    t = time.time()
+    for k in ('X_tr', 'y_tr', 'w_sub_all', 'X_va', 'y_va', 'val_pos', 'n_true_all', 's1_country', 's1_ids'):
+        np.save(os.path.join(STATE_DIR, f'{k}.npy'), np.asarray(st[k]))
+    st['meta_tr'].to_parquet(os.path.join(STATE_DIR, 'meta_tr.parquet'), index=False)
+    st['meta_va'].to_parquet(os.path.join(STATE_DIR, 'meta_va.parquet'), index=False)
+    with open(os.path.join(STATE_DIR, 'small.json'), 'w') as f:
+        json.dump({'feat_cols': st['feat_cols'], 'n_s1': int(st['n_s1']), 'recall_stats': st['recall_stats']}, f)
+    log.info(f"  checkpoint saved -> {STATE_DIR} ({time.time() - t:.0f}s; ER_RESUME=1 restarts from the model stage)")
+
+
+def load_state():
+    st = {}
+    for k in ('X_tr', 'y_tr', 'w_sub_all', 'X_va', 'y_va', 'val_pos', 'n_true_all', 's1_country', 's1_ids'):
+        st[k] = np.load(os.path.join(STATE_DIR, f'{k}.npy'), allow_pickle=True)
+    st['meta_tr'] = pd.read_parquet(os.path.join(STATE_DIR, 'meta_tr.parquet'))
+    st['meta_va'] = pd.read_parquet(os.path.join(STATE_DIR, 'meta_va.parquet'))
+    with open(os.path.join(STATE_DIR, 'small.json')) as f:
+        small = json.load(f)
+    st.update(feat_cols=small['feat_cols'], n_s1=small['n_s1'], recall_stats=small['recall_stats'], t0=time.time())
+    log.info(f"  checkpoint loaded <- {STATE_DIR}: train {st['X_tr'].shape}, val {st['X_va'].shape}")
+    return st
+
+
 def main():
     t0 = time.time()
     os.makedirs(cfg.MODEL_DIR, exist_ok=True)
@@ -215,7 +243,14 @@ def main():
             preprocessed_s23[country] = df_c
         return preprocessed_s23[country]
 
-    keep_s23_cached = os.environ.get('ER_CACHE_S23', '1' if len(df_s23_raw) < 4_000_000 else '0') == '1'
+    # keep the preprocessed S2/S3 of every country in RAM between Pass A and Pass B+C when memory allows
+    # (~600 B/row -> ~6 GB for the full data): saves one full preprocessing per country
+    auto_cache = '1' if (len(df_s23_raw) < 4_000_000 or cfg.TOTAL_RAM_GB >= 45) else '0'
+    keep_s23_cached = os.environ.get('ER_CACHE_S23', auto_cache) == '1'
+    # with the S2/S3 frames cached, the per-country Blocker (5 vocabulary fits + reverse product) is built once
+    # and reused between Pass A and Pass B+C
+    blocker_cache = {} if keep_s23_cached else None
+    log.info(f"  S2/S3 + Blocker cache between passes: {keep_s23_cached} (rows={len(df_s23_raw):,}, ram={cfg.TOTAL_RAM_GB:.0f} GB)")
 
     # ---------- Pass A (all countries first): extra-token statistics + blocking recall ----------
     for country in countries:
@@ -229,7 +264,8 @@ def main():
         true_fused_ranks = []
         cap = cfg.BLOCK_MAX_CANDIDATES
         # labels only (no feature cost): retrieve deeper than the cap so the recall curve is informative above it
-        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_stats, max_candidates=max(150, cap)):
+        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_stats, max_candidates=max(150, cap),
+                                                      blocker_cache=blocker_cache):
             lab = (owner_c[cand['s23_pos'].values] == cand['s1_pos'].values)
             in_cap = cand['fused_rank'].values < cap
             found += int((lab & in_cap).sum())
@@ -262,7 +298,7 @@ def main():
         # their S1 is exact.
         log.info(f"--- Pass B+C (train + val splits) country={country} ---")
         mask_bc = ((split == 1) | (split == 3)) & (s1_country == country)
-        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_bc):
+        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_bc, blocker_cache=blocker_cache):
             if len(cand) == 0:
                 continue
             feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.N_JOBS)
@@ -292,17 +328,34 @@ def main():
                 }))
             del feat
         preprocessed_s23.pop(country, None)
+        if blocker_cache is not None:
+            blocker_cache.pop(country, None)
         del df_s23_c, owner_c
         gc.collect()
 
     del df_s23_raw
     gc.collect()
 
-    X_tr = np.concatenate(train_X)
+    def _stack(parts):
+        """Concatenate float32 chunks into a preallocated matrix, freeing each chunk as it is copied
+        (np.concatenate would hold both the parts and the result: 2x the peak on the full data)."""
+        n_rows = sum(p.shape[0] for p in parts)
+        if n_rows == 0:
+            return np.zeros((0, len(feat_cols)), dtype=FEAT_DTYPE)
+        out = np.empty((n_rows, parts[0].shape[1]), dtype=FEAT_DTYPE)
+        i = 0
+        while parts:
+            p = parts.pop(0)
+            out[i:i + len(p)] = p
+            i += len(p)
+            del p
+        return out
+
+    X_tr = _stack(train_X)
     y_tr = np.concatenate(train_y)
     w_sub_all = np.concatenate(train_w).astype(np.float32)
     meta_tr = pd.concat(train_meta, ignore_index=True)
-    X_va = np.concatenate(val_X)
+    X_va = _stack(val_X)
     y_va = np.concatenate(val_y)
     meta_va = pd.concat(val_meta, ignore_index=True)
     del train_X, val_X
@@ -318,6 +371,24 @@ def main():
     X_tr[np.ix_(m, [col_idx['x_extra_min'], col_idx['x_extra_mean']])] = extra_stats.prior
     X_tr[m, col_idx['x_extra_known']] = 0.0
     log.info(f"  France-robustness masking applied to {int(m.sum()):,} of {int(has_extra.sum()):,} rows with extra tokens")
+
+    # ---------- checkpoint: everything the model + decision stages need (pod restarts, CatBoost crashes,
+    # decision-layer re-runs). ER_RESUME=1 restarts from here in seconds instead of ~1 h of features. ----------
+    state = dict(X_tr=X_tr, y_tr=y_tr, w_sub_all=w_sub_all, meta_tr=meta_tr, X_va=X_va, y_va=y_va, meta_va=meta_va,
+                 feat_cols=feat_cols, val_pos=val_pos, n_s1=n_s1, n_true_all=n_true_all, s1_country=s1_country,
+                 s1_ids=df_s1['entity_id'].values, recall_stats=recall_stats, t0=t0)
+    if cfg.CHECKPOINT_MATRICES:
+        save_state(state)
+    return model_and_decision(state)
+
+
+def model_and_decision(st):
+    """Model training + decision-layer selection from the checkpointed matrices (steps 9-11)."""
+    X_tr, y_tr, w_sub_all, meta_tr = st['X_tr'], st['y_tr'], st['w_sub_all'], st['meta_tr']
+    X_va, y_va, meta_va, feat_cols = st['X_va'], st['y_va'], st['meta_va'], st['feat_cols']
+    val_pos, n_s1, n_true_all, s1_country, s1_ids = st['val_pos'], st['n_s1'], st['n_true_all'], st['s1_country'], st['s1_ids']
+    recall_stats, t0 = st['recall_stats'], st['t0']
+    os.makedirs(cfg.MODEL_DIR, exist_ok=True)
 
     # ---------------- 9. models ----------------
     log.info("=" * 70)
@@ -346,14 +417,25 @@ def main():
     probs = {'lgbm': p_va}
 
     if cfg.USE_CATBOOST:
-        try:
-            from catboost import CatBoostClassifier
-            cb = CatBoostClassifier(**cfg.CATBOOST_PARAMS)
-            cb.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=(X_va, y_va), use_best_model=True)
-            cb.save_model(os.path.join(cfg.MODEL_DIR, 'catboost.cbm'))
-            probs['catboost'] = cb.predict_proba(X_va)[:, 1]
-        except Exception as e:  # noqa
-            log.warning(f"CatBoost failed ({e}); continuing with LightGBM only")
+        from catboost import CatBoostClassifier
+        cb_params = dict(cfg.CATBOOST_PARAMS)
+        attempts = [cb_params]
+        if cb_params.get('task_type') == 'GPU':
+            # GPU failures (driver / CUDA runtime mismatch, e.g. very new CUDA on the pod) fall back to CPU
+            # with a bounded number of iterations so the ensemble survives without eating the time budget
+            attempts.append(dict(cb_params, task_type='CPU', iterations=cfg.CATBOOST_CPU_FALLBACK_ITERATIONS))
+        for params in attempts:
+            try:
+                log.info(f"  CatBoost task_type={params['task_type']} iterations={params['iterations']} threads={params.get('thread_count')}")
+                cb = CatBoostClassifier(**params)
+                cb.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=(X_va, y_va), use_best_model=True)
+                cb.save_model(os.path.join(cfg.MODEL_DIR, 'catboost.cbm'))
+                probs['catboost'] = cb.predict_proba(X_va)[:, 1]
+                break
+            except Exception as e:  # noqa
+                log.warning(f"CatBoost ({params['task_type']}) failed: {e}")
+        if 'catboost' not in probs:
+            log.warning("CatBoost unavailable; continuing with LightGBM only")
     del X_tr, y_tr
     gc.collect()
 
@@ -589,7 +671,7 @@ def main():
     fp_other = int((m_best & (lab == 0) & ~meta_va['s23_distractor'].values).sum())
     log.info(f"    false-positive pairs: on unmatched distractor rows={fp_distractor:,}  on rows owned by another S1={fp_other:,}")
     val_out = meta_va[['s1_pos', 's23_id', 'country', 'st_tset', 'num_first_rel', 's23_distractor', 'addr_empty_s23']].copy()
-    val_out['s1_id'] = df_s1['entity_id'].values[val_s1_pos]
+    val_out['s1_id'] = s1_ids[val_s1_pos]
     val_out['prob'] = P_best.astype(np.float32)          # the probability the selected decision actually used
     val_out['prob_mean'] = prob.astype(np.float32)
     for k, p in probs.items():
@@ -617,6 +699,8 @@ def main():
         'start_threshold': float(np.mean(main_ts) + cfg.UNSEEN_COUNTRY_THRESHOLD_SHIFT),
         'target_singleton_rate': float(max(cfg.UNSEEN_TARGET_SINGLETON_RATE, np.mean(list(empty_rate_val.values())))),
         'max_threshold': float(cfg.UNSEEN_MAX_THRESHOLD),
+        'max_raise': 0.20,                                       # never raise more than this above the start
+        'seen_mean_links': float(np.mean(list(mean_links_val.values()))),   # stop raising when links fall well below
         'noaddr_delta': float(np.mean(noaddr_deltas)) if noaddr_deltas else 0.0,
     }
     log.info(f"  unseen-country settings: {unseen}")
@@ -655,4 +739,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if cfg.RESUME_FROM_CHECKPOINT:
+        model_and_decision(load_state())
+    else:
+        main()

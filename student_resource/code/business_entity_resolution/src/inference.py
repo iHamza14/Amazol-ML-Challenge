@@ -253,9 +253,38 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
         if n_with_pairs:
             no_cand_rate = (n_c - n_with_pairs) / n_c
             target_adj = max(0.0, (target - no_cand_rate) / max(1e-9, n_with_pairs / n_c))
-            t_c, rate_c = calibrate_unseen_threshold(P_p[cm], codes_c, n_with_pairs, start_t, target_adj,
-                                                     max_t=float(unseen.get('max_threshold', cfg.UNSEEN_MAX_THRESHOLD)))
+            max_t = float(unseen.get('max_threshold', cfg.UNSEEN_MAX_THRESHOLD))
+            delta_na = float(unseen.get('noaddr_delta', 0.0)) if mcfg.get('per_bin_thresholds', True) else 0.0
+            sub_s1, sub_s23, sub_p, sub_g = P_s1[cm], s23_code[cm], P_p[cm], P_group[cm]
+
+            def applied_stats(t):
+                # the rule that will actually be applied (per-bin thresholds, size-adaptive, conflicts, mode)
+                cfg_c = dict(dec, thresholds={c: t, c + '|noaddr': min(0.99, t + delta_na)}, default_threshold=t)
+                m_c = decide(sub_s1, sub_s23, sub_p, sub_g, cfg_c)
+                counts = np.bincount(codes_c[m_c], minlength=n_with_pairs)
+                return float((counts == 0).mean()), float(counts.sum() / n_c)
+
+            # raise-only, but never past the point where it starts destroying recall: stop when the country's
+            # mean links per entity fall well below the seen countries' level, or after max_raise
+            seen_links = float(unseen.get('seen_mean_links', 3.4))
+            max_raise = float(unseen.get('max_raise', 0.20))
+            t_c = float(start_t)
+            rate_c, links_c = applied_stats(t_c)
+            stop_reason = 'target reached' if rate_c >= target_adj else 'max threshold'
+            while rate_c < target_adj and t_c + 0.005 <= max_t:
+                if t_c + 0.005 > start_t + max_raise:
+                    stop_reason = f'max raise {max_raise} above start'
+                    break
+                r2, l2 = applied_stats(round(t_c + 0.005, 4))
+                if l2 < seen_links - 0.2:
+                    stop_reason = f'mean links would fall below seen level {seen_links:.2f} - 0.2'
+                    break
+                t_c = round(t_c + 0.005, 4)
+                rate_c, links_c = r2, l2
+                if rate_c >= target_adj:
+                    stop_reason = 'target reached'
             overall_empty = no_cand_rate + rate_c * n_with_pairs / n_c
+            log.info(f"  unseen country '{c}': calibration stopped ({stop_reason}); mean links {links_c:.3f} vs seen {seen_links:.3f}")
         else:
             t_c, rate_c, overall_empty = start_t, 1.0, 1.0
         thresholds[c] = t_c

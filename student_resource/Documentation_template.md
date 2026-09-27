@@ -177,9 +177,12 @@ inserted-word statistics.
 ### A. Code Artefacts
 `code/business_entity_resolution/src/`: `config.py`, `text_tables.py`, `translit.py`,
 `preprocess.py`, `blocking.py`, `features.py`, `evaluate.py`, `decision.py`, `france_filter.py`,
-`train.py` (entry point 1: trains models and selects the decision config), `inference.py` (entry
-point 2: writes `output/matching_results.tsv` and `output/candidate_pairs.tsv` and runs the
-validator). `README.md` gives the exact commands; `requirements.txt` pins the environment.
+`train.py` (entry point 1: trains models and selects the decision config; checkpoints the training
+matrices so the model stage can be re-run with `ER_RESUME=1`), `inference.py` (entry point 2: writes
+`output/matching_results.tsv` and `output/candidate_pairs.tsv` and runs the validator),
+`make_sample.py` (stratified sample dataset for smoke tests). `README.md` gives the exact commands;
+`requirements.txt` pins the environment; `setup_runpod.sh` (repository root) is the one-command setup
+used for the submitted run (1x A40, 9 vCPU, 50 GB RAM).
 
 ### B. Additional Results
 [feature importance table, threshold sweep, per-country diagnostics]

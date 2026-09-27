@@ -93,7 +93,11 @@ positions remapped) and sends it pickled, exactly the mechanism `preprocess_data
 this pod without incident. Measured on 250k pairs: identical output (all 124 columns), 33 MB pickled per 100k
 pairs, ~10k pairs/s per worker. Budget: 3 GB per worker + 6 GB headroom against the live parent RSS (a >3x
 margin), tasks of 100k pairs, `ER_FEATURE_WORKERS=1` forces the main process (~12k pairs/s) if ever wanted.
-Log lines: `feature workers capped 9 -> N (parent rss ...)`. Memory monitor while a run is going:
+Log lines: `feature workers capped 9 -> N (parent rss ...)`. Since commit after `bd2ae3b` the budget is MEASURED: a
+thread samples each worker's private memory (`/proc/<pid>/smaps_rollup` Private_Dirty, i.e. pages not shared with the
+parent) once a second; the next chunk uses 1.5x the observed peak per worker (the 20k run showed the parent flat at
+26.6 GB with 4 workers, so the real cost is far below the 3 GB static guess and the pool grows to all 9 CPUs).
+Log line: `features: ... worker peak private X GB -> next budget Y GB/worker`. Memory monitor while a run is going:
 ```bash
 nohup bash -c 'while true; do echo "$(date +%T) $(cat /sys/fs/cgroup/memory.current 2>/dev/null | awk "{printf \"%.1f GB\", \$1/1e9}")"; sleep 30; done' > /workspace/mem.log 2>&1 &
 ```

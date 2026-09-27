@@ -25,6 +25,7 @@ the two preprocessed frames; strings are pulled by position from numpy arrays.
 """
 import json
 import logging
+import threading
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
@@ -650,16 +651,64 @@ def split_by_s1_groups(cand_sorted, target_pairs):
     return [(a, b) for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
 
 
+_MEASURED_WORKER_GB = None      # peak private memory of a feature worker seen so far in this process (GB)
+
+
+def _workers_private_gb(pids):
+    """Largest private (copied or allocated, i.e. not shared with the parent) memory among the workers, in GB,
+    from /proc/<pid>/smaps_rollup. RSS would count the parent's shared pages and is useless for a forked child."""
+    mx = 0.0
+    for pid in pids:
+        try:
+            with open(f'/proc/{pid}/smaps_rollup') as f:
+                for line in f:
+                    if line.startswith('Private_Dirty:'):
+                        mx = max(mx, int(line.split()[1]) / 1e6)      # kB -> GB
+                        break
+        except Exception:  # noqa
+            pass
+    return mx
+
+
+class _WorkerMemProbe(threading.Thread):
+    """Samples the workers' private memory once a second while a pool is busy; .peak is the maximum seen."""
+
+    def __init__(self, pids):
+        super().__init__(daemon=True)
+        self.pids = list(pids)
+        self.peak = 0.0
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.wait(1.0):
+            self.peak = max(self.peak, _workers_private_gb(self.pids))
+
+    def stop(self):
+        self._stop.set()
+        self.join(timeout=5)
+        self.peak = max(self.peak, _workers_private_gb(self.pids))
+        return self.peak
+
+
+def _worker_budget_gb():
+    """GB per worker for pool sizing: 1.5x the measured peak once one chunk has been measured (never below 0.5 GB),
+    the static FEATURE_WORKER_GB before that."""
+    if _MEASURED_WORKER_GB:
+        return max(0.5, 1.5 * _MEASURED_WORKER_GB)
+    return cfg.FEATURE_WORKER_GB
+
+
 def _pool_size(n_jobs):
-    """Workers allowed by the RAM budget: parent RSS + workers * FEATURE_WORKER_GB + headroom <= TOTAL_RAM_GB."""
+    """Workers allowed by the RAM budget: parent RSS + workers * budget + headroom <= TOTAL_RAM_GB."""
     try:
         if cfg.TOTAL_RAM_GB > 0:
             rss = cfg.rss_gb()
+            budget = _worker_budget_gb()
             free = cfg.TOTAL_RAM_GB - rss - cfg.FEATURE_RAM_HEADROOM_GB
-            allowed = max(1, int(free / cfg.FEATURE_WORKER_GB))
+            allowed = max(1, int(free / budget))
             if allowed < n_jobs:
                 log.info(f"  feature workers capped {n_jobs} -> {allowed} (parent rss {rss:.1f} GB of {cfg.TOTAL_RAM_GB:.0f} GB, "
-                         f"budget {cfg.FEATURE_WORKER_GB:.0f} GB/worker + {cfg.FEATURE_RAM_HEADROOM_GB:.0f} GB headroom)")
+                         f"budget {budget:.1f} GB/worker + {cfg.FEATURE_RAM_HEADROOM_GB:.0f} GB headroom)")
                 return allowed
     except Exception:  # noqa
         pass
@@ -692,16 +741,24 @@ def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, 
     t0 = time.time()
     gc.collect()
     gc.freeze()          # inherited objects go to the permanent generation: nothing in the parent's heap is traversed later
+    global _MEASURED_WORKER_GB
+    probe = None
     try:
         with ctx.Pool(n_workers, initializer=_par_init, initargs=(vecs, extra_stats)) as pool:
+            if platform.system() == 'Linux':
+                probe = _WorkerMemProbe([p.pid for p in pool._pool])
+                probe.start()
             feats = list(pool.imap(_par_work, tasks))          # ordered; results stream back as parts finish
+            peak = probe.stop() if probe is not None else 0.0
     finally:
         gc.unfreeze()
     feat = pd.concat(feats, ignore_index=True)
     del feats
+    if peak > 0:
+        _MEASURED_WORKER_GB = max(_MEASURED_WORKER_GB or 0.0, peak)
     dt = max(1e-6, time.time() - t0)
     log.info(f"  features: {n:,} pairs in {dt:.0f}s ({n / dt:,.0f} pairs/s; {n_workers} workers, {len(bounds)} tasks; "
-             f"parent rss {cfg.rss_gb():.1f} GB)")
+             f"parent rss {cfg.rss_gb():.1f} GB; worker peak private {peak:.2f} GB -> next budget {_worker_budget_gb():.1f} GB/worker)")
     inv = np.empty_like(order)
     inv[order] = np.arange(n)
     return feat.iloc[inv].reset_index(drop=True)

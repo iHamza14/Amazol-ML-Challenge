@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
+**Team Name:** Orcya  
+**Team Members:** Hamza Anwar (lead), Harsh Dahiya, Afzal, Shahan Ayyubi  
 **Submission Date:** 27 September 2026
 
 ---
@@ -247,7 +247,7 @@ inference alike.
   matches, which no downstream stage could otherwise reach.
 - **Candidate set:** about 20 candidates per S1 entity after the two-stage cascade (150–200 retrieved,
   then pruned and capped), see section 3.
-- **Public leaderboard:** [..]
+- **Public leaderboard:** as shown on the challenge portal for the submitted `matching_results.tsv`.
 - **Reference run with 20 000 training entities (same full-scale pools, previous retrieval settings):**
   0.97560 plain / 0.97391 density-adjusted (US 0.97877 / 0.97742, India 0.97067 / 0.96843); ensemble
   AUC 0.99989. Error decomposition on its 5 000 validation entities (122 entity-equivalents lost): 66 % of

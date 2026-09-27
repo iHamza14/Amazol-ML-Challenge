@@ -35,6 +35,9 @@ cp -r "$SRC/code/business_entity_resolution" "$OUT/code/"
 rm -rf "$OUT/code/business_entity_resolution/src/__pycache__"
 cp "$SRC/Documentation_template.md" "$OUT/Documentation_template.md"
 
+if [[ "${FAST:-0}" == "1" ]]; then
+  echo "== FAST=1: validator and statistics skipped (row counts checked above; split_merge.py checked ids and order)"
+else
 echo "== validator (matching + candidate files)"
 python "$SRC/utils/validate_submission.py" --matching "$OUT/output/matching_results.tsv" \
   --candidate "$OUT/output/candidate_pairs.tsv" --test-dir "$TEST_DIR" | tail -15
@@ -59,6 +62,7 @@ with open(sys.argv[2], encoding='utf-8') as f:
         tot += k; n += 1; empty += (k == 0)
 print(f"matches per S1: mean {tot / max(1, n):.3f}, predicted-empty rate {empty / max(1, n):.4f} (training truth: 3.46 and 0.056)")
 EOF
+fi
 
 echo "== zip"
 python -c "import shutil; shutil.make_archive('$OUT', 'zip', '$OUT')"

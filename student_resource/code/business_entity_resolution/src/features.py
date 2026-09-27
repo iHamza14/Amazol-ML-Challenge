@@ -732,7 +732,10 @@ def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, 
     s1p = cand['s1_pos'].values
     order = np.argsort(s1p, kind='stable')
     cand_sorted = cand.iloc[order].reset_index(drop=True)
-    bounds = split_by_s1_groups(cand_sorted, cfg.FEATURE_TASK_PAIRS)
+    # at least one task per worker: after pruning a chunk holds only ~200k pairs, and 100k-pair tasks left
+    # 14 of 16 workers idle (2 workers, 23 s per chunk on the pod)
+    target = min(cfg.FEATURE_TASK_PAIRS, max(5000, -(-n // max(1, n_jobs))))
+    bounds = split_by_s1_groups(cand_sorted, target)
     n_workers = min(n_jobs, len(bounds))
     tasks = (_slice_task(cand_sorted.iloc[a:b], df_s1, df_s23) for a, b in bounds)   # lazy: one slice in flight at a time
     ctx = mp.get_context('fork')

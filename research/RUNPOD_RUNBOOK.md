@@ -128,6 +128,28 @@ export DATA_ROOT=/workspace/dataset PROJECT_ROOT=/workspace/er_project ER_N_JOBS
 EOS
 ```
 
+## 5f. Decision-layer options added after the research sweep (validated automatically at step 10)
+- **Rank ladder** (`decision.ladder_select`): per-rank deltas for the 2nd / 3rd / 4th+ link (grid of non-decreasing
+  triples over RANK_DELTA_GRID) x an optional cap on links per entity (MAX_LINKS_GRID). The single delta of the
+  earlier rule is the diagonal, so validation can only tie or improve. Log: `rank ladder best of N: deltas=... max_links=...`.
+- **Address-empty unique-claimant rescue** (`decision.noaddr_rescue`): an address-less record not yet selected is
+  given to its top claimant when that claim >= t[country], no other S1 claims it (or the lead is >= 0.30) and the
+  claimant has < 11 links. Adopted only if the density-adjusted score rises by >= 0.0002; the log prints the
+  rescued-set precision and how many rescued rows are distractors. Unseen countries get the strictest seen t.
+- France max raise 0.20 -> 0.25 (the 20k run stopped at the cap short of the target empty rate).
+- `ER_RESUME=1 ER_REUSE_MODELS=1 python -B train.py` re-runs ONLY the decision layer from the checkpoint and the saved
+  models (minutes): use it to apply decision-layer code changes to a finished training run before inference.
+
+## 5g. candidate_pairs.tsv now counts (organizers' final-10-hours note): stage-2 pruner
+The README defines candidate_pairs.tsv as "the exact set of records you feed into your matching model" and the
+organizers rank smaller candidate sets higher. Inference used to write every retrieved pair (~175 per S1, ~300M
+rows). Now a stage-2 pruner (LightGBM on the 16 blocking meta features only, trained in step 9b from the same
+checkpoint) drops hopeless pairs right after retrieval; its per-country threshold keeps 99.9% of the retrieved true
+matches on validation (`pruner <country>: threshold ... keeps 0.999 ... N retrieved -> M candidates per S1`).
+Only survivors get the 124 features and the models, and candidate_pairs.tsv = survivors. Inference log:
+`<country>: retrieved N pairs (x/S1) -> candidates scored M (y/S1)`. Switches: `ER_PRUNE=0` (score everything, old
+behaviour), `ER_PRUNE_RECALL=0.999`. Applies to a finished training via `ER_RESUME=1 ER_REUSE_MODELS=1`.
+
 ## 6. Warnings
 - **Pod restart wipes pip packages**: re-run `setup_runpod.sh --no-smoke` (2 min), then `source /workspace/env.sh`.
 - **Do not run two trainings at once** on 50 GB.

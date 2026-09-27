@@ -116,11 +116,25 @@ def decide(s1_code, s23_code, prob, country, cfg_dec):
                 floor[country == c] = t
             mask &= prob >= floor
     else:
-        mask = threshold_select(prob, country, cfg_dec.get('thresholds') or {}, cfg_dec.get('default_threshold', 0.5))
-    delta = float(cfg_dec.get('extra_link_delta', 0.0) or 0.0)
-    if delta != 0:
-        t_pair = pair_thresholds(country, cfg_dec.get('thresholds') or {}, cfg_dec.get('default_threshold', 0.5))
-        mask = size_adaptive(s1_code, prob, mask, t_pair + delta, relax=delta < 0)
+        thresholds = cfg_dec.get('thresholds') or {}
+        default = cfg_dec.get('default_threshold', 0.5)
+        mask = threshold_select(prob, country, thresholds, default)
+        # rank ladder (per-rank deltas + link cap); a uniform extra_link_delta is the special case d2 == d3 == d4
+        deltas = cfg_dec.get('rank_deltas')
+        delta = float(cfg_dec.get('extra_link_delta', 0.0) or 0.0)
+        max_links = int(cfg_dec.get('max_links', 0) or 0)
+        if deltas is None and delta != 0:
+            deltas = [delta, delta, delta]
+        if (deltas is not None and any(float(x) != 0 for x in deltas)) or max_links > 0:
+            t_pair = pair_thresholds(country, thresholds, default)
+            mask = ladder_select(s1_code, prob, t_pair, deltas or [0.0, 0.0, 0.0], max_links)
+    if cfg_dec.get('mode', 'threshold') == 'expected_f':
+        delta = float(cfg_dec.get('extra_link_delta', 0.0) or 0.0)
+        if delta != 0:
+            t_pair = pair_thresholds(country, cfg_dec.get('thresholds') or {}, cfg_dec.get('default_threshold', 0.5))
+            mask = size_adaptive(s1_code, prob, mask, t_pair + delta, relax=delta < 0)
+    if cfg_dec.get('noaddr_rescue'):
+        mask = noaddr_rescue(s1_code, s23_code, prob, country, mask, cfg_dec['noaddr_rescue'])
     if cfg_dec.get('resolve_conflicts', True):
         mask = resolve_conflicts(s1_code, s23_code, prob, mask)
     return mask
@@ -162,6 +176,93 @@ def size_adaptive(s1_code, prob, mask, floor, relax=False):
     new_mask = np.zeros_like(mask)
     new_mask[order[keep]] = True
     return new_mask
+
+
+def rank_within_entity(s1_code, prob):
+    """0-based rank of every pair among its entity's pairs by probability (descending)."""
+    order = np.lexsort((-prob, s1_code))
+    s = s1_code[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(s)) + 1]
+    counts = np.diff(np.r_[starts, len(s)])
+    within = np.arange(len(s)) - np.repeat(starts, counts)
+    rank = np.empty(len(prob), dtype=np.int64)
+    rank[order] = within
+    return rank
+
+
+def ladder_select(s1_code, prob, t_pair, deltas, max_links=0):
+    """
+    Rank ladder: generalised size-adaptive acceptance. An entity is anchored when some pair passes its own
+    threshold (t_pair, per pair: country / address bin). Its top-probability pair is accepted iff it passes its
+    threshold; the pair at rank r >= 1 is accepted iff prob >= threshold + deltas[min(r, 3) - 1]. Negative deltas
+    relax (an anchored entity is a confirmed non-singleton; under F0.5 the break-even for the k+1-th link rises
+    with k, so the deltas are meant to be non-decreasing: d2 <= d3 <= d4), positive ones tighten (Foursquare
+    4th place). With non-decreasing deltas the accepted set is a prefix of the entity's ranking. max_links > 0
+    additionally keeps only the top max_links pairs of an entity unless a pair's prob >= 0.99 (impossible-count
+    guard: same-name chains with city-only addresses collect dozens of claims). deltas (0, 0, 0) and
+    max_links 0 reproduce the plain threshold rule exactly.
+    """
+    m0 = prob >= t_pair
+    if len(s1_code) == 0:
+        return m0
+    anchored = np.zeros(int(s1_code.max()) + 1, dtype=bool)
+    anchored[s1_code[m0]] = True
+    rank = rank_within_entity(s1_code, prob)
+    d = [0.0] + [float(x) for x in list(deltas)[:3]]
+    while len(d) < 4:
+        d.append(d[-1])
+    d = np.asarray(d, dtype=np.float64)
+    floor = t_pair + d[np.minimum(rank, 3)]
+    keep = np.where(rank == 0, m0, anchored[s1_code] & (prob >= floor))
+    if max_links and int(max_links) > 0:
+        keep &= (rank < int(max_links)) | (prob >= 0.99)
+    return keep
+
+
+def noaddr_rescue(s1_code, s23_code, prob, group, mask, params):
+    """
+    Address-empty unique-claimant rescue. Address-less S2/S3 records are noisy copies of SOME S1 almost always
+    (the distractor generator keeps addresses; several teams measured ~0.3% empty addresses among unmatched
+    records vs ~4-5% among true copies), so for them the question is ownership, not existence. A record in the
+    '|noaddr' bin that is not yet selected is accepted for its TOP claimant when that claimant's prob >=
+    t[country] and either no other S1 claims the record (claim = prob >= claim_prob) or the top claim leads
+    the runner-up by >= margin, and the claimant has fewer than max_links accepted pairs. Applied before
+    conflict resolution; selected on the density-adjusted validation metric with a precision report.
+    params: {'t': {country: t}, 'claim_prob': 0.10, 'margin': 0.30, 'max_links': 11}
+    """
+    if not params or not params.get('t') or len(prob) == 0:
+        return mask
+    group = np.asarray(group).astype(str)
+    is_na = np.char.endswith(group, '|noaddr')
+    if not is_na.any():
+        return mask
+    country = np.array([g.split('|')[0] for g in group])
+    t = np.full(len(prob), np.inf)
+    for c, v in params['t'].items():
+        t[country == c] = float(v)
+    claim_p = float(params.get('claim_prob', 0.10))
+    margin = float(params.get('margin', 0.30))
+    max_links = int(params.get('max_links', 11))
+    claims = is_na & (prob >= claim_p)
+    idx = np.flatnonzero(claims)
+    if len(idx) == 0:
+        return mask
+    order = idx[np.lexsort((-prob[idx], s23_code[idx]))]
+    s = s23_code[order]
+    p_o = prob[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(s)) + 1]
+    counts = np.diff(np.r_[starts, len(s)])
+    within = np.arange(len(s)) - np.repeat(starts, counts)
+    p_top = np.repeat(p_o[starts], counts)
+    second = np.where(counts > 1, p_o[np.minimum(starts + 1, len(s) - 1)], 0.0)
+    p_2nd = np.repeat(second, counts)
+    n_claim = np.repeat(counts, counts)
+    ok = (within == 0) & ((n_claim == 1) | (p_top - p_2nd >= margin))
+    cand = np.zeros(len(prob), dtype=bool)
+    cand[order[ok]] = True
+    n_acc = np.bincount(s1_code[mask], minlength=int(s1_code.max()) + 1)
+    rescue = cand & ~mask & (prob >= t) & (n_acc[s1_code] < max_links)
+    return mask | rescue
 
 
 def calibrate_unseen_threshold(prob, s1_code, n_s1, start_t, target_empty_rate, max_t=0.97, step=0.005):

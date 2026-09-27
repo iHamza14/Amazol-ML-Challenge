@@ -284,6 +284,40 @@ USE_CONSENSUS = True                     # also evaluate min(model probs) instea
 # non-singleton and its further candidates are accepted at the lower bar (missed links were 66% of the validation
 # loss in the 20k run, and tightening lost 0.0003). Selected on validation like every other decision option.
 EXTRA_LINK_DELTA_GRID = [-0.30, -0.25, -0.20, -0.15, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15]
+# Rank ladder (decision.ladder_select): deltas for the 2nd, 3rd and 4th+ link, searched over all non-decreasing
+# triples of this grid (the uniform delta above is the diagonal), times an optional cap on links per entity.
+# Under F0.5 the break-even probability of the (k+1)-th link rises with k (0.727, 0.759, 0.771, 0.8 ...), so one
+# delta cannot fit every rank (Foursquare 4th/16th place used rank-dependent thresholds and a max group size).
+RANK_DELTA_GRID = [-0.30, -0.20, -0.10, -0.05, 0.0, 0.05, 0.10]
+MAX_LINKS_GRID = [0, 10]          # 0 = no cap; training entities have at most ~11 matches
+# Address-empty unique-claimant rescue (decision.noaddr_rescue): per-country threshold grid, adopted only when the
+# density-adjusted validation score improves by at least NOADDR_RESCUE_MIN_GAIN. Another team measured
+# +0.0017/+0.0019 validation from treating address-less records as 'owned by someone' (aditya-bheke, public repo);
+# a version without the uniqueness gate lost score (48% precision on the rescued set).
+NOADDR_RESCUE_T_GRID = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+NOADDR_RESCUE_CLAIM_PROB = 0.10
+NOADDR_RESCUE_MARGIN = 0.30
+NOADDR_RESCUE_MAX_LINKS = 11
+NOADDR_RESCUE_MIN_GAIN = 0.0002
+# unseen country (France): the raise-only calibration may lift the threshold at most this much above its start.
+# 0.20 stopped short of the target empty rate in the 20k run (0.0569 vs 0.0603); public LB probes by other teams
+# put the France optimum around 0.90-0.92 on their scales, with 0.95 worse -> 0.25 keeps the stop conditions.
+UNSEEN_MAX_RAISE = 0.25
+
+# ============================================================
+# Stage-2 candidate pruner (cascade)
+# ============================================================
+# Retrieval (stage 1) returns up to 150-200 candidates per S1 entity. Before the matching model scores a pair, a
+# small LightGBM on the BLOCKING META FEATURES ONLY (per-channel retrieval scores and ranks, fused rank, reverse
+# rank/score: all free by-products of retrieval) drops the pairs that are hopeless. Its per-country threshold
+# is the largest value that keeps PRUNE_RECALL of the retrieved true matches on validation. The survivors are
+# the exact set the matching model scores and what output/candidate_pairs.tsv reports (README: "the final
+# candidate list just before the ML model scores them"). Cuts inference feature cost 5-10x. ER_PRUNE=0 disables.
+USE_PRUNER = os.environ.get('ER_PRUNE', '1') != '0'
+PRUNE_RECALL = float(os.environ.get('ER_PRUNE_RECALL', 0.999))
+PRUNER_PARAMS = dict(objective='binary', learning_rate=0.1, num_leaves=63, min_data_in_leaf=200, feature_fraction=0.9,
+                     bagging_fraction=0.8, bagging_freq=1, max_bin=255, verbose=-1, seed=RANDOM_SEED, num_threads=N_JOBS)
+PRUNER_ROUNDS = 300
 
 # ============================================================
 # Experiments (all off by default)

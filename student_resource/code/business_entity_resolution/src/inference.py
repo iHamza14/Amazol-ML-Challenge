@@ -160,7 +160,23 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
             dec.setdefault('thresholds', {})[c] = float(unseen_t)
             log.info(f"  unseen country '{c}': threshold {unseen_t:.3f}")
 
-    # ---------------- 3. blocking + scoring ----------------
+    # ---------------- 3. blocking -> stage-2 pruner -> scoring ----------------
+    # cascade: retrieval returns up to 150-200 pairs per entity; the pruner (LightGBM on the retrieval meta features
+    # only) keeps the pairs worth scoring; the survivors are the candidate set (candidate_pairs.tsv) and the only
+    # pairs the matching model runs on
+    pruner = None
+    pr_cfg = mcfg.get('pruner')
+    pruner_path = os.path.join(model_dir, 'pruner.txt')
+    if pr_cfg and os.path.exists(pruner_path):
+        import lightgbm as lgb
+        pruner = lgb.Booster(model_file=pruner_path)
+        pr_cols = list(pr_cfg['features'])
+        pr_thr = {str(k): float(v) for k, v in pr_cfg['thresholds'].items()}
+        pr_default = float(pr_cfg.get('default_threshold', min(pr_thr.values()) if pr_thr else 0.0))
+        log.info(f"  candidate pruner loaded: thresholds {pr_thr} (unseen countries use {pr_default:.5f}); "
+                 f"validation: {pr_cfg.get('val_stats')}")
+    elif pr_cfg:
+        log.warning("  model_config has a pruner but pruner.txt is missing: scoring every retrieved pair")
     cand_lists = [None] * n_s1            # per S1 position: np.array of S2/S3 ids (str)
     pred_s1, pred_s23, pred_p, pred_st, pred_rel, pred_noaddr = [], [], [], [], [], []
     pred_models = {k: [] for k in models}
@@ -180,9 +196,18 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
         s23_ids_c = df_s23_c['entity_id'].values
         mask_c = s1_country == country
         n_pairs = 0
+        n_retrieved = 0
         for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_c, max_candidates=max_candidates):
             if len(cand) == 0:
                 continue
+            n_retrieved += len(cand)
+            if pruner is not None:
+                s_pr = pruner.predict(cand[pr_cols].values.astype(np.float32))
+                keep_pr = s_pr >= pr_thr.get(str(country), pr_default)
+                cand = cand.loc[keep_pr].reset_index(drop=True)
+                log.info(f"  pruner kept {int(keep_pr.sum()):,} of {len(keep_pr):,} retrieved pairs ({100 * keep_pr.mean():.1f}%)")
+                if len(cand) == 0:
+                    continue
             s1p = cand['s1_pos'].values
             s23p = cand['s23_pos'].values
             # candidate lists (complete per S1 within a chunk)
@@ -208,7 +233,9 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
             pred_noaddr.append(feat['f_addr_empty_s23'].values[keep].astype(bool))
             n_pairs += len(cand)
             del feat, X
-        log.info(f"  {country}: scored {n_pairs:,} candidate pairs")
+        n_ent_c = max(1, int(mask_c.sum()))
+        log.info(f"  {country}: retrieved {n_retrieved:,} pairs ({n_retrieved / n_ent_c:.1f}/S1) -> candidates scored "
+                 f"{n_pairs:,} ({n_pairs / n_ent_c:.1f}/S1)")
         del df_s23_c
         gc.collect()
     del df_s23_raw
@@ -252,6 +279,13 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
     # rate reaches the generator's singleton share (label-free calibration; never lowered)
     unseen = mcfg.get('unseen_country', {})
     thresholds = dict(dec.get('thresholds', {}))
+    # the address-empty rescue threshold of an unseen country is the strictest seen one (raise-only), set before
+    # the calibration below so that the calibrated rule is the rule that is applied
+    if dec.get('noaddr_rescue') and dec['noaddr_rescue'].get('t'):
+        for c in pd.unique(s1_country):
+            if c not in seen_countries and str(c) not in dec['noaddr_rescue']['t']:
+                dec['noaddr_rescue']['t'][str(c)] = float(max(dec['noaddr_rescue']['t'].values()))
+                log.info(f"  unseen country '{c}': noaddr rescue threshold {dec['noaddr_rescue']['t'][str(c)]:.3f} (max of seen)")
     for c in pd.unique(s1_country):
         if c in seen_countries:
             continue

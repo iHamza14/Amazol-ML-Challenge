@@ -66,29 +66,46 @@ entity retrieves its top-k neighbours with sparse matrix products (`sparse_dot_t
 
 | Channel | Document | top-k |
 |---|---|---|
-| `name_tok` | core-name word unigrams (legal forms removed, transliterated, de-leeted, segmented) | 60 |
-| `name_chr` | character 3-grams of the space-less core name (typos, leetspeak, collapsed domains) | 40 |
-| `addr_tok` | address words + numbers (abbreviations canonicalised, admin unit as one token) | 60 |
-| `addr_num` | (number, street word) combinations — the most precise address key | 40 |
-| `joint` | name + address tokens in one vector | 80 |
+| `name_tok` | core-name word unigrams (legal forms removed, transliterated, de-leeted, segmented) | 250 |
+| `name_chr` | character 3-grams of the space-less core name (typos, leetspeak, collapsed domains) | 250 |
+| `addr_tok` | address words + numbers (abbreviations canonicalised, admin unit as one token) | 250 |
+| `addr_num` | (number, street word) combinations — the most precise address key | 250 |
+| `joint` | name + address tokens in one vector | 250 |
 
 Tokens occurring in more than 3 % of the country's S2/S3 rows are dropped; cosine < 0.08 is never a
 candidate. A **reverse channel** additionally lets every S2/S3 record retrieve its top-5 S1 entities on
 the joint vector: the S1's rank in that list is a "competition" feature (is this S1 the record's best
-owner?) and each record's top-1 S1 is added as an extra candidate. The union is capped at 100
-candidates per S1 entity by (best channel rank, summed score); on a 40k-entity held-out sample the
-true-pair recall by fused rank is 99.75 % @80, 99.80 % @100 and 99.84 % @150 (US) and 99.55 / 99.65 /
-99.75 % (India), and none of six alternative fused orderings (joint score, summed scores,
-reverse-aware sums) beat it. The residual tail is empty-address records with garbled names and
-Indic names with truncated addresses. Every candidate keeps its score and rank in every channel as
-model features.
+owner?) and each record's top-1 S1 is added as an extra candidate.
 
-- **Candidate pairs generated:** [total, from inference log]
-- **Recall on a held-out training split:** [from train log, per country]
+**Candidate generation is a two-stage cascade**, because the search space is cut in two different ways:
+
+*Stage 1 — retrieval.* The channels are fused by **reciprocal-rank fusion** (sum over channels of
+1/(60 + rank); the reverse rank r counts as 2r) and capped per S1 entity at **150 (US, France) / 200
+(India)**. Retrieval depth is nearly free (the sparse product, not the top-n selection, dominates the
+cost), so every channel retrieves deep and the fusion decides what enters the cap. Measured on a
+1.24 M-record India pool (30 % of full scale, 6 000 queries, 22 090 true matches): the old min-rank
+fusion at depth 60/40/60/40/80 saturated at ~198 candidates and 0.9928 recall even uncapped
+(0.9890 at cap 100); depth 250 with RRF reaches 0.9928 at cap 150 and 0.9939 at cap 200. The residual
+tail is empty-address records with destroyed names and same-name chains whose address is truncated
+to a city — unreachable by any retrieval.
+
+*Stage 2 — candidate pruner.* Every retrieved pair carries its score and rank in every channel, the
+fused rank and the reverse rank/score — 16 numbers that cost nothing extra. A small LightGBM (63 leaves,
+300 rounds) trained on these numbers alone scores each retrieved pair, and a per-country threshold —
+the largest value that keeps **99.9 % of the retrieved true matches on the validation split** — drops
+the hopeless pairs before any string comparison is made. The survivors are the candidate set: the exact
+pairs the matching model computes its 124 features for and scores, and the content of
+`output/candidate_pairs.tsv`. This stage cuts the pairs the matching model sees by roughly an order of
+magnitude at a measured recall cost of 0.1 % of the reachable matches.
+
+- **Candidates per S1 entity:** [from inference log: `retrieved N/S1 -> candidates scored M/S1`, per country]
+- **Recall on a held-out training split:** [from train log: `BLOCKING RECALL at the shipped cap` per country;
+  `pruner <country>: threshold ... keeps 0.999 of retrieved true matches`]
 - **How true matches are not lost:** name and address channels are unioned (only 0.02 % of true
   pairs share neither a name nor an address token), the Indic transliteration and domain-name
-  segmentation make otherwise token-less names retrievable, and the character-3-gram channel
-  covers typos/leetspeak.
+  segmentation make otherwise token-less names retrievable, the character-3-gram channel covers
+  typos/leetspeak, RRF lifts candidates found by several channels above single-channel same-name
+  floods, and the pruner threshold is set from measured recall, not by hand.
 
 ---
 

@@ -32,7 +32,7 @@ from translit import Transliterator
 from blocking import iter_candidate_chunks
 from features import compute_features, compute_features_parallel, ExtraTokenStats, feature_columns
 from evaluate import threshold_sweep, best_threshold, f05_from_counts, score_selection
-from decision import (decide, resolve_conflicts, expected_f05_select, threshold_select, pair_groups,
+from decision import (decide, resolve_conflicts, expected_f05_select, threshold_select, pair_groups, ladder_select,
                       size_adaptive, calibrate_unseen_threshold, pair_thresholds)
 from france_filter import apply_france_filter
 
@@ -409,20 +409,36 @@ def model_and_decision(st):
         w_tr *= np.where(y_tr > 0, 1.0 / nt, 1.0).astype(np.float32)
         log.info(f"  macro sample weights on (mean positive weight {w_tr[y_tr > 0].mean():.3f})")
     log.info(f"  sample weights: {int((w_tr > 1).sum()):,} deep negatives x{1.0 / cfg.NEG_RANDOM_FRAC:.1f}")
-    dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, feature_name=feat_cols, free_raw_data=False)
-    dval = lgb.Dataset(X_va, label=y_va, reference=dtrain, free_raw_data=False)
-    params = dict(cfg.LGBM_PARAMS)
-    booster = lgb.train(params, dtrain, num_boost_round=cfg.LGBM_ROUNDS, valid_sets=[dval],
-                        callbacks=[lgb.early_stopping(cfg.LGBM_EARLY_STOP), lgb.log_evaluation(100)])
-    booster.save_model(os.path.join(cfg.MODEL_DIR, 'lgbm.txt'))
-    imp = pd.DataFrame({'feature': feat_cols, 'gain': booster.feature_importance('gain'),
-                        'split': booster.feature_importance('split')}).sort_values('gain', ascending=False)
-    imp.to_csv(os.path.join(cfg.MODEL_DIR, 'feature_importance.csv'), index=False)
-    log.info("  top-25 features by gain:\n" + imp.head(25).to_string(index=False))
-    p_va = booster.predict(X_va, num_iteration=booster.best_iteration)
+    # ER_REUSE_MODELS=1 (with ER_RESUME=1): load the models saved by the previous run and re-run only the
+    # decision layer (minutes instead of the model stage) -- for decision-layer changes after training
+    lgbm_path = os.path.join(cfg.MODEL_DIR, 'lgbm.txt')
+    cb_path = os.path.join(cfg.MODEL_DIR, 'catboost.cbm')
+    reuse = os.environ.get('ER_REUSE_MODELS') == '1' and os.path.exists(lgbm_path)
+    if reuse:
+        booster = lgb.Booster(model_file=lgbm_path)
+        log.info(f"  ER_REUSE_MODELS=1: loaded {lgbm_path} ({booster.num_trees()} trees); model training skipped")
+        p_va = booster.predict(X_va)
+    else:
+        dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, feature_name=feat_cols, free_raw_data=False)
+        dval = lgb.Dataset(X_va, label=y_va, reference=dtrain, free_raw_data=False)
+        params = dict(cfg.LGBM_PARAMS)
+        booster = lgb.train(params, dtrain, num_boost_round=cfg.LGBM_ROUNDS, valid_sets=[dval],
+                            callbacks=[lgb.early_stopping(cfg.LGBM_EARLY_STOP), lgb.log_evaluation(100)])
+        booster.save_model(lgbm_path)
+        imp = pd.DataFrame({'feature': feat_cols, 'gain': booster.feature_importance('gain'),
+                            'split': booster.feature_importance('split')}).sort_values('gain', ascending=False)
+        imp.to_csv(os.path.join(cfg.MODEL_DIR, 'feature_importance.csv'), index=False)
+        log.info("  top-25 features by gain:\n" + imp.head(25).to_string(index=False))
+        p_va = booster.predict(X_va, num_iteration=booster.best_iteration)
     probs = {'lgbm': p_va}
 
-    if cfg.USE_CATBOOST:
+    if cfg.USE_CATBOOST and reuse and os.path.exists(cb_path):
+        from catboost import CatBoostClassifier
+        cb = CatBoostClassifier()
+        cb.load_model(cb_path)
+        probs['catboost'] = cb.predict_proba(X_va)[:, 1]
+        log.info(f"  ER_REUSE_MODELS=1: loaded {cb_path}")
+    elif cfg.USE_CATBOOST:
         from catboost import CatBoostClassifier
         cb_params = dict(cfg.CATBOOST_PARAMS)
         attempts = [cb_params]
@@ -442,6 +458,46 @@ def model_and_decision(st):
                 log.warning(f"CatBoost ({params['task_type']}) failed: {e}")
         if 'catboost' not in probs:
             log.warning("CatBoost unavailable; continuing with LightGBM only")
+    # ---------------- 9b. stage-2 candidate pruner (cascade) ----------------
+    # trained on the blocking meta features only; per-country threshold = keep PRUNE_RECALL of the retrieved true
+    # matches on validation (X_va holds EVERY retrieved pair of the validation entities, so this is the real recall)
+    pruner_cfg = None
+    pruner_score_va = None
+    if cfg.USE_PRUNER:
+        from blocking import BLOCK_META_COLS
+        meta_cols = [c for c in BLOCK_META_COLS if c in feat_cols]
+        mi = [feat_cols.index(c) for c in meta_cols]
+        pruner_path = os.path.join(cfg.MODEL_DIR, 'pruner.txt')
+        log.info("=" * 70)
+        log.info(f"STEP 9b: candidate pruner (cascade stage 2) on {len(meta_cols)} blocking features: {meta_cols}")
+        if reuse and os.path.exists(pruner_path):
+            pruner = lgb.Booster(model_file=pruner_path)
+            log.info(f"  ER_REUSE_MODELS=1: loaded {pruner_path}")
+        else:
+            dpr = lgb.Dataset(X_tr[:, mi], label=y_tr, weight=w_tr, feature_name=meta_cols, free_raw_data=True)
+            pruner = lgb.train(dict(cfg.PRUNER_PARAMS), dpr, num_boost_round=cfg.PRUNER_ROUNDS)
+            pruner.save_model(pruner_path)
+            del dpr
+        pruner_score_va = pruner.predict(X_va[:, mi]).astype(np.float32)
+        va_country = meta_va['country'].values.astype(str)
+        thr, stats = {}, {}
+        for c in pd.unique(va_country):
+            cm = va_country == c
+            pos = pruner_score_va[cm & (y_va > 0)]
+            if len(pos) == 0:
+                continue
+            t_c = float(np.quantile(pos, 1.0 - cfg.PRUNE_RECALL))
+            surv = cm & (pruner_score_va >= t_c)
+            n_ent = int(len(np.unique(meta_va['s1_pos'].values[cm])))
+            rec = float((surv & (y_va > 0)).sum() / max(1, (cm & (y_va > 0)).sum()))
+            thr[str(c)] = t_c
+            stats[str(c)] = {'retrieved_per_s1': round(float(cm.sum() / max(1, n_ent)), 2),
+                             'candidates_per_s1': round(float(surv.sum() / max(1, n_ent)), 2),
+                             'recall_of_retrieved_true': round(rec, 5)}
+            log.info(f"  pruner {c}: threshold {t_c:.5f} keeps {rec:.5f} of retrieved true matches | "
+                     f"{stats[str(c)]['retrieved_per_s1']} retrieved -> {stats[str(c)]['candidates_per_s1']} candidates per S1")
+        pruner_cfg = {'features': meta_cols, 'thresholds': thr, 'default_threshold': float(min(thr.values())) if thr else 0.0,
+                      'recall_target': float(cfg.PRUNE_RECALL), 'val_stats': stats}
     del X_tr, y_tr
     gc.collect()
 
@@ -460,6 +516,14 @@ def model_and_decision(st):
     # mimic inference exactly: only pairs whose max-model probability >= DECISION_KEEP_PROB reach the decision layer
     p_max_va = np.max(np.stack([probs[k] for k in probs]), axis=0)
     keep_va = p_max_va >= cfg.DECISION_KEEP_PROB
+    if pruner_cfg is not None and pruner_score_va is not None:
+        # pairs the pruner drops are never scored at inference: drop them here too (train == inference)
+        va_country = meta_va['country'].values.astype(str)
+        t_pair_pr = np.array([pruner_cfg['thresholds'].get(c, pruner_cfg['default_threshold']) for c in va_country])
+        pruned = pruner_score_va < t_pair_pr
+        lost_pos = int((pruned & (y_va > 0)).sum())
+        keep_va &= ~pruned
+        log.info(f"  pruner removes {int(pruned.sum()):,} of {len(pruned):,} validation pairs before scoring ({lost_pos:,} true matches lost)")
     log.info(f"  decision layer sees {int(keep_va.sum()):,} of {len(keep_va):,} validation pairs (max-model prob >= {cfg.DECISION_KEEP_PROB})")
     meta_va = meta_va.loc[keep_va].reset_index(drop=True)
     y_va = y_va[keep_va]
@@ -530,17 +594,67 @@ def model_and_decision(st):
                      'score_adj': max(f_adj, f_adj_rc), 'score_plain': f_plain_rc if use_rc else f_plain}
         if best is None or cand_best['score_adj'] > best['score_adj']:
             best = cand_best
-        # size-adaptive acceptance: 2nd+ links of an entity need prob >= entity floor + delta
+        # rank ladder: per-rank deltas (2nd, 3rd, 4th+ link; non-decreasing) x optional cap on links per entity.
+        # The uniform delta of the earlier rule is the diagonal of this grid, so this can only tie or improve.
         t_pair = pair_thresholds(group_pair, thresholds, t_glob)
-        for delta in [d for d in cfg.EXTRA_LINK_DELTA_GRID if d != 0]:
-            m_sa = size_adaptive(s1_code, P, m_thr, t_pair + delta, relax=delta < 0)
-            if use_rc:
-                m_sa = resolve_conflicts(s1_code, s23_code, P, m_sa)
-            f_sa, _ = score_mask(m_sa)
-            f_sa_plain, _ = score_mask(m_sa, adjusted=False)
-            log.info(f"  [{pm}] size-adaptive delta={delta:.2f}: adj-F0.5={f_sa:.5f} plain={f_sa_plain:.5f}")
-            if f_sa > best['score_adj']:
-                best = dict(cand_best, extra_link_delta=float(delta), score_adj=f_sa, score_plain=f_sa_plain)
+        D = list(cfg.RANK_DELTA_GRID)
+        combos = [(a, b, c) for a in D for b in D for c in D if a <= b <= c]
+        best_ladder = None
+        for max_links in cfg.MAX_LINKS_GRID:
+            for ds in combos:
+                if ds == (0.0, 0.0, 0.0) and not max_links:
+                    continue
+                m_l = ladder_select(s1_code, P, t_pair, ds, max_links)
+                if use_rc:
+                    m_l = resolve_conflicts(s1_code, s23_code, P, m_l)
+                f_l, _ = score_mask(m_l)
+                if best_ladder is None or f_l > best_ladder[0]:
+                    best_ladder = (f_l, ds, max_links, m_l)
+        if best_ladder is not None:
+            f_l, ds, max_links, m_l = best_ladder
+            f_l_plain, _ = score_mask(m_l, adjusted=False)
+            log.info(f"  [{pm}] rank ladder best of {len(combos) * len(cfg.MAX_LINKS_GRID)}: deltas={ds} max_links={max_links}: "
+                     f"adj-F0.5={f_l:.5f} plain={f_l_plain:.5f} (plain threshold rule {cand_best['score_adj']:.5f})")
+            if f_l > best['score_adj']:
+                best = dict(cand_best, rank_deltas=[float(x) for x in ds], max_links=int(max_links), extra_link_delta=0.0,
+                            score_adj=f_l, score_plain=f_l_plain)
+        # address-empty unique-claimant rescue on top of the best threshold-mode rule of this prob mode
+        if best.get('mode') == 'threshold' and best.get('prob_mode') == pm:
+            base_cfg = {k: v for k, v in best.items() if k != 'noaddr_rescue'}
+            m_base = decide(s1_code, s23_code, P, group_pair, base_cfg)
+            f_base = best['score_adj']
+            rp_fixed = {'claim_prob': float(cfg.NOADDR_RESCUE_CLAIM_PROB), 'margin': float(cfg.NOADDR_RESCUE_MARGIN),
+                        'max_links': int(cfg.NOADDR_RESCUE_MAX_LINKS)}
+            t_e = {}
+            for c in pd.unique(country_of_code):          # gains are separable per country (macro over entities)
+                best_c, f_c = None, f_base
+                for tv in cfg.NOADDR_RESCUE_T_GRID:
+                    trial = dict(t_e)
+                    trial[str(c)] = float(tv)
+                    m_r = decide(s1_code, s23_code, P, group_pair, dict(base_cfg, noaddr_rescue=dict(rp_fixed, t=trial)))
+                    f_r, _ = score_mask(m_r)
+                    if f_r > f_c + 1e-9:
+                        best_c, f_c = float(tv), f_r
+                if best_c is not None:
+                    t_e[str(c)] = best_c
+                    f_base = f_c
+            if t_e:
+                rp = dict(rp_fixed, t=t_e)
+                m_r = decide(s1_code, s23_code, P, group_pair, dict(base_cfg, noaddr_rescue=rp))
+                f_r, pc_r = score_mask(m_r)
+                f_r_plain, _ = score_mask(m_r, adjusted=False)
+                rescued = m_r & ~m_base
+                prec = float(lab[rescued].mean()) if rescued.any() else float('nan')
+                n_dis = int((rescued & meta_va['s23_distractor'].values).sum())
+                log.info(f"  [{pm}] noaddr unique-claimant rescue t={t_e}: adj-F0.5 {best['score_adj']:.5f} -> {f_r:.5f} {pc_r} "
+                         f"plain {f_r_plain:.5f} | rescued {int(rescued.sum()):,} pairs, precision {prec:.3f}, on distractor rows {n_dis:,}")
+                if f_r >= best['score_adj'] + cfg.NOADDR_RESCUE_MIN_GAIN:
+                    best = dict(base_cfg, noaddr_rescue=rp, score_adj=f_r, score_plain=f_r_plain)
+                    log.info("  noaddr rescue ADOPTED")
+                else:
+                    log.info("  noaddr rescue rejected (gain below the adoption margin)")
+            else:
+                log.info(f"  [{pm}] noaddr unique-claimant rescue: no threshold improved the adjusted score")
         if cfg.USE_EXPECTED_F05:
             for floor in (0.0, 0.3, 0.4):
                 m_ef = expected_f05_select(s1_code, P, min_prob=0.05)
@@ -705,7 +819,7 @@ def model_and_decision(st):
         'start_threshold': float(np.mean(main_ts) + cfg.UNSEEN_COUNTRY_THRESHOLD_SHIFT),
         'target_singleton_rate': float(max(cfg.UNSEEN_TARGET_SINGLETON_RATE, np.mean(list(empty_rate_val.values())))),
         'max_threshold': float(cfg.UNSEEN_MAX_THRESHOLD),
-        'max_raise': 0.20,                                       # never raise more than this above the start
+        'max_raise': float(cfg.UNSEEN_MAX_RAISE),                # never raise more than this above the start
         'seen_mean_links': float(np.mean(list(mean_links_val.values()))),   # stop raising when links fall well below
         'noaddr_delta': float(np.mean(noaddr_deltas)) if noaddr_deltas else 0.0,
     }
@@ -723,6 +837,7 @@ def model_and_decision(st):
                      'by_country': dict(cfg.BLOCK_BY_COUNTRY), 'fusion': cfg.BLOCK_FUSION, 'rrf_c': float(cfg.BLOCK_RRF_C),
                      'min_score': float(cfg.BLOCK_MIN_SCORE), 'max_df_frac': float(cfg.BLOCK_MAX_DF_FRAC)},
         'per_bin_thresholds': bool(cfg.PER_BIN_THRESHOLDS),
+        'pruner': pruner_cfg,
         'unseen_country': unseen,
         'unseen_country_threshold': unseen['start_threshold'],
         'val_macro_f05': f_best,

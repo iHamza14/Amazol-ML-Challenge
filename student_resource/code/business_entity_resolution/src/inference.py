@@ -260,6 +260,23 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
         P_noaddr = np.zeros(0, dtype=bool)
     P_p = combine_probs(P_models, weights, dec.get('prob_mode', 'mean'))
     P_country = s1_country[P_s1]
+    # persist the scored pairs (everything the decision layer consumes) so that redecide.py can re-run the
+    # decision layer with other settings (France threshold, consensus, shift) in minutes instead of hours.
+    # Best effort: a failure here must never stop the run.
+    try:
+        t_dump = time.time()
+        scored = pd.DataFrame({'s1_pos': P_s1.astype(np.int64), 's23_id': P_s23.astype(str),
+                               'st_tset': P_st.astype(np.float32), 'num_first_rel': P_rel.astype(np.int8),
+                               'addr_empty_s23': P_noaddr.astype(bool)})
+        for k, v in P_models.items():
+            scored[f'prob_{k}'] = v.astype(np.float32)
+        scored.to_parquet(os.path.join(output_dir, 'scored_pairs.parquet'), index=False)
+        pd.DataFrame({'entity_id': s1_ids.astype(str), 'country': s1_country.astype(str)}).to_parquet(
+            os.path.join(output_dir, 'scored_s1.parquet'), index=False)
+        del scored
+        log.info(f"  scored pairs saved -> {os.path.join(output_dir, 'scored_pairs.parquet')} ({len(P_s1):,} rows, {time.time() - t_dump:.0f}s)")
+    except Exception as e:  # noqa
+        log.warning(f"  could not save the scored pairs (redecide.py will not be available): {e}")
     if dec.get('calibrated') and dec.get('calibrators'):
         # per-country isotonic calibration (fitted on validation); unseen countries get the mean of the seen curves
         cals = dec['calibrators']

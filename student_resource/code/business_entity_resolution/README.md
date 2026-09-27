@@ -1,71 +1,98 @@
 # Business Entity Resolution — pipeline v2
 
-Blocking (multi-channel sparse TF-IDF top-k) → 109 pair features → LightGBM + CatBoost →
-entity-level decision layer (per-country thresholds / expected-F0.5 set selection, one-S1-per-S2/S3
-conflict resolution) → unseen-country (France) filter → `matching_results.tsv` + `candidate_pairs.tsv`.
+Candidate generation as a cascade (five-channel sparse TF-IDF retrieval at top-k 250, reciprocal-rank fusion,
+cap 150/200 per S1 → stage-2 pruner on the retrieval scores) → 124 pair features → LightGBM + CatBoost →
+entity-level decision layer (per-country / per-bin thresholds, rank ladder, one-S1-per-S2/S3 conflict rule,
+address-empty unique-claimant rule, expected-F0.5 alternative) → label-free France calibration →
+`matching_results.tsv` + `candidate_pairs.tsv`.
 
 Everything is learned from the provided training data only. No external data, APIs, registries or
 geocoding are used anywhere. Static normalisation tables (state abbreviations, street-type
 abbreviations, legal-form abbreviations, ordinal words) live in `text_tables.py`.
 
-## Reproduce end-to-end
+## Reproduce end-to-end (two commands)
 
 ```bash
 pip install -r ../requirements.txt          # pandas, numpy, scipy, scikit-learn, lightgbm, catboost,
                                             # rapidfuzz, unidecode, sparse_dot_topn, pyarrow
-export DATA_ROOT=/path/to/dataset           # contains train/ and test/  (auto-detected on SageMaker:
-                                            # /home/ec2-user/SageMaker/dataset ; on the dev laptop: repo/Dataset ML Amazon)
+export DATA_ROOT=/path/to/dataset           # contains train/ and test/ (case-insensitive)
+export PROJECT_ROOT=/path/for/models_cache_output   # models/, cache/, output/ are created here
+export ER_N_JOBS=16                         # CPU count; set it explicitly inside containers that report the host's cores
 cd src
-python train.py                             # ~1-2 h on 8 vCPU: writes ../../../models/*
-python inference.py                         # ~1 h: writes ../../../output/matching_results.tsv and candidate_pairs.tsv
-                                            # and runs utils/validate_submission.py automatically
+ER_SAMPLE_S1=300000 ER_STATS_S1=60000 python train.py     # ~1.5 h on 16 vCPU + GPU: writes $PROJECT_ROOT/models/*
+python inference.py                                        # ~4 h on the full test set: writes $PROJECT_ROOT/output/
+                                                           # matching_results.tsv, candidate_pairs.tsv, scored_pairs.parquet
+                                                           # and runs utils/validate_submission.py on the matching file
 ```
 
-RunPod: `bash setup_runpod.sh` at the repository root installs everything, verifies the GPU and runs a
-smoke test; see `research/RUNPOD_RUNBOOK.md`. After the feature stage `train.py` writes a checkpoint
-(`cache/train_state`, ~15 GB on the full data); `ER_RESUME=1 python train.py` restarts at the model stage.
+The submitted run used exactly these settings (300 000 training entities, 60 000 statistics entities, 75 000
+validation entities, each searched against the full S2/S3 pool of its country).
 
-Useful environment variables: `ER_N_JOBS` (worker processes; auto-detected from the cgroup CPU quota inside
-containers, default all cores), `ER_SAMPLE_S1`
-(number of S1 entities used for training pairs; default 400000; e.g. 100000 for a 30-40 min run),
-`ER_MAX_CANDIDATES` (candidate cap per S1, default 100, identical for train and inference),
-`ER_NO_CATBOOST=1` (LightGBM only), `ER_FRANCE_FILTER=1` (enable the street-support filter for unseen
-countries; off by default because it hurt seen countries on validation), `ER_CACHE_S23=1` (keep the
-preprocessed S2/S3 frames of all countries in memory between passes — needs ~64 GB on the full data).
+After the feature stage `train.py` writes a checkpoint (`cache/train_state`); `ER_RESUME=1 python train.py`
+restarts at the model stage, and `ER_RESUME=1 ER_REUSE_MODELS=1 python train.py` re-runs only the pruner and
+the decision layer with the saved models (minutes). `python redecide.py` re-runs only the decision layer on
+the scored pairs saved by inference (`--france-threshold`, `--france-shift`, `--threshold-shift`,
+`--consensus`; output `matching_results_<tag>.tsv`, the inference result is never overwritten).
+`../../../../package_submission.sh` assembles and validates the submission zip.
 
-Verified end-to-end on a 40k-S1 local sample: `train.py` 11 min (val macro-F0.5 0.985 with only 20k
-training entities), `inference.py` + official validator PASS.
+Environment variables (all in `config.py`): `ER_N_JOBS`, `ER_SAMPLE_S1` (training entities, default 400000),
+`ER_STATS_S1` (cap on the statistics split), `ER_MAX_CANDIDATES` (default cap 150) and `ER_BLOCK_BY_COUNTRY`
+(per-country cap / depth overrides, default India cap 200), `ER_BLOCK_TOPK` (per-channel depths, default
+250 each), `ER_BLOCK_FUSION` (`rrf` default, `minrank`), `ER_PRUNE=0` (score every retrieved pair),
+`ER_PRUNE_RECALL` (default 0.999), `ER_FEATURE_WORKERS`, `ER_NO_CATBOOST=1`, `ER_GPU=0/1`, `ER_REVERSE=0`,
+`ER_CACHE_S23=0/1`, `ER_CHECKPOINT=0`, `ER_LOCO=<country>` (leave-one-country-out diagnostics),
+`ER_FRANCE_FILTER=1` (street-support filter for unseen countries; off by default because it hurt seen
+countries on validation). Every blocking, pruner and decision setting used in training is persisted in
+`models/model_config.json`, and inference applies the trained values regardless of the environment.
 
 `inference.py` flags: `--threshold-shift 0.02` (add to every decision threshold; positive = more
-precision), `--consensus` (use the minimum over LightGBM/CatBoost instead of the mean — a precision
-filter), `--no-conflicts`, `--no-france-filter`, `--max-candidates N`, `--test-dir`, `--output-dir`,
-`--model-dir`.
+precision), `--consensus` (minimum over LightGBM/CatBoost instead of the mean), `--no-conflicts`,
+`--no-france-filter`, `--test-dir`, `--output-dir`, `--model-dir`.
 
-Decision-layer selection in `train.py` is **density-adjusted**: false positives on unmatched (distractor)
-S2/S3 rows are weighted 1.9x (the test pool has 5.75 S2/S3 rows per S1 vs 4.67 in train with the same
-3.46 true matches per S1), because plain validation was found to overstate the leaderboard by ~0.015 in
-every public log. Thresholds are per country and per bin (candidate address present / empty). France,
-unseen in training, starts at the mean seen threshold + 0.02 and is then raised (never lowered) until
-its predicted-empty rate reaches the generator's 5.6% singleton share.
+## How the pieces fit
+
+1. **Preprocessing** (`preprocess.py`, `translit.py`, `text_tables.py`): transliteration dictionary learned from
+   ground-truth pairs, unidecode, dotted acronyms, d/b/a and "formerly" splits, domain-name detection with
+   Viterbi word segmentation over the S1 vocabulary, guarded leetspeak repair, legal-form families; addresses
+   parsed into components with admin units as single tokens and truncation-aware house numbers.
+2. **Retrieval** (`blocking.py`): per country, five TF-IDF channels with `sparse_dot_topn` (top-k 250 each),
+   a reverse channel (each S2/S3 record's top-5 S1; its top-1 becomes a candidate), reciprocal-rank fusion,
+   cap 150 (US, France) / 200 (India). Measured on a 1.24 M-record India pool: the previous min-rank fusion at
+   depths 60/40/60/40/80 saturated at 0.9928 recall even uncapped; depth 250 + RRF gives 0.9939 at cap 200.
+3. **Stage-2 pruner** (`train.py` step 9b, applied in `inference.py`): LightGBM on the 16 retrieval meta
+   features only; per-country threshold = keep 99.9 % of the retrieved true matches on validation. Survivors
+   are the candidate set (`candidate_pairs.tsv`) and the only pairs that get features and model scores.
+4. **Features** (`features.py`, 124) computed in forked workers that receive pickled slices of their rows.
+5. **Models**: LightGBM + CatBoost (GPU), averaged; negatives subsampled by retrieval rank and re-weighted.
+6. **Decision layer** (`decision.py`), selected on validation with a density-adjusted macro-F0.5 (false
+   positives on distractor rows weighted 1.9x for the denser test pool): thresholds per country and address
+   bin, rank ladder, conflict resolution, address-empty rescue, expected-F0.5 alternatives. France (unseen):
+   raise-only calibration of the applied rule to the seen countries' predicted-empty rate.
 
 ## Files
 
 | File | Role |
 |---|---|
-| `config.py` | paths (auto-detect SageMaker/Windows), all hyper-parameters |
+| `config.py` | paths (auto-detect RunPod / SageMaker / Windows), CPU and RAM detection inside containers, all hyper-parameters |
 | `text_tables.py` | static normalisation tables (US/India/France admin names, address & legal abbreviations, ordinals, leetspeak map, blocking stopwords) |
 | `translit.py` | Indic→Latin transliteration dictionary learned from ground-truth pairs (99.7% token coverage on validation) |
-| `preprocess.py` | name/address normalisation: dotted abbreviations, d/b/a, domain-collapsed names (Viterbi word segmentation with the S1 vocabulary), leetspeak, legal forms, comma-component address parsing, admin canonicalisation, number extraction |
-| `blocking.py` | per-country multi-channel sparse TF-IDF retrieval with `sparse_dot_topn` (name tokens, name char-3grams, address tokens, number+street combos, joint); union with per-channel score/rank meta-features; reverse channel (each S2/S3 record's top-5 S1 → rank/score feature and its top-1 S1 as an extra candidate), `ER_REVERSE=0` disables |
-| `features.py` | 109 vectorised pair features (rapidfuzz `cpdist`, sparse cosines, house-number relation codes, learned extra-token statistics, group-relative features) |
+| `preprocess.py` | name/address normalisation (see above); copy-on-write-safe multiprocessing |
+| `blocking.py` | per-country retrieval, reverse channel, reciprocal-rank fusion, per-country caps and depths |
+| `features.py` | 124 vectorised pair features (rapidfuzz `cpdist`, sparse cosines, house-number relation codes, learned extra-token statistics, group-relative features); RAM-budgeted worker pool |
 | `evaluate.py` | vectorised entity-level macro F0.5 and threshold sweeps |
-| `decision.py` | thresholds, expected-F0.5 set selection, S2/S3 conflict resolution |
-| `france_filter.py` | unseen-country safety filter (street similarity + number-relation support) |
-| `train.py` | full training pipeline (splits, statistics, features, models, decision selection) |
-| `inference.py` | full inference pipeline + output writing + validator |
-| `cross_encoder.py` | optional Phase-2 multilingual cross-encoder (not used in the submitted run unless stated) |
+| `decision.py` | thresholds, rank ladder, address-empty rescue, expected-F0.5 set selection, conflict resolution, unseen-country calibration |
+| `france_filter.py` | optional unseen-country safety filter (off by default) |
+| `train.py` | full training pipeline (splits, statistics, retrieval recall, features, models, pruner, decision selection, checkpoints) |
+| `inference.py` | full inference pipeline: retrieval → pruner → features → models → decision → outputs + validator |
+| `redecide.py` | decision layer only, on the saved scored pairs |
+| `make_sample.py` | stratified sample dataset for smoke tests |
+| `cross_encoder.py` | legacy experiment, not used |
 
 ## Outputs of `train.py` (in `models/`)
-`lgbm.txt`, `catboost.cbm`, `model_config.json` (feature list, ensemble weights, decision config,
-validation scores, blocking recall), `translit.json`, `seg_vocab.json`, `extra_token_stats.json`,
-`feature_importance.csv`.
+`lgbm.txt`, `catboost.cbm`, `pruner.txt`, `model_config.json` (feature list, ensemble weights, blocking
+settings, pruner thresholds, decision config, validation scores, blocking recall), `translit.json`,
+`seg_vocab.json`, `extra_token_stats.json`, `feature_importance.csv`, `val_predictions.parquet`.
+
+## Outputs of `inference.py` (in `output/`)
+`matching_results.tsv`, `candidate_pairs.tsv`, `scored_pairs.parquet` + `scored_s1.parquet` (inputs of
+`redecide.py`).

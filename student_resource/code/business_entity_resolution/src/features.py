@@ -30,11 +30,14 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 
+import config as cfg
 from blocking import BLOCK_META_COLS
 
 log = logging.getLogger(__name__)
 
-WORKERS = -1
+# rapidfuzz threads in the main process (the cgroup quota, not the host core count: -1 would start 96 threads
+# on a 9-CPU pod); forked workers set this to 1
+WORKERS = cfg.N_JOBS
 # admin units the noise generator swaps in TRUE pairs (Telangana was carved out of Andhra Pradesh in 2014)
 ADMIN_ALIASES = {frozenset(('zzintg', 'zzinap'))}
 
@@ -589,68 +592,111 @@ def feature_columns(feat):
 
 
 # ------------------------------------------------------------------
-# Parallel feature computation (Linux/fork only; falls back to serial elsewhere)
+# Parallel feature computation (Linux/fork only; falls back to the main process elsewhere)
+#
+# Memory model (the reason for the design): the parent holds ~27 GB of Python-object frames on the full
+# data. A forked worker that reads those frames dirties every page it touches (refcount writes), which cost
+# 4-5 GB per worker and OOM-killed two full runs on a 47 GB pod. Workers therefore receive a pickled copy of
+# ONLY their slice (the rows of df_s1 / df_s23 their pairs reference, positions remapped) and never touch the
+# inherited frames; the vectorizers and extra-token statistics are inherited read-only and are small.
+# Per-worker cost = slice (~150 MB per 100k pairs) + working set (~300 MB); the pool is sized against the RAM
+# budget with FEATURE_WORKER_GB = 3 GB per worker, i.e. a 3x margin on the measured need.
 # ------------------------------------------------------------------
 _PAR = {}
 
 
-def _par_init(df_s1, df_s23, vecs, extra_stats):
+def _par_init(vecs, extra_stats):
     global _PAR, WORKERS
     import gc
-    gc.disable()         # children allocate only short-lived per-pair objects; no collections over the inherited heap
-    _PAR = {'s1': df_s1, 's23': df_s23, 'vecs': vecs, 'stats': extra_stats}
+    gc.disable()         # workers allocate only short-lived per-task objects; no collections over the inherited heap
+    _PAR = {'vecs': vecs, 'stats': extra_stats}
     WORKERS = 1          # rapidfuzz threads: one per process, the pool provides the parallelism
 
 
-def _par_work(cand_sub):
-    return compute_features(cand_sub, _PAR['s1'], _PAR['s23'], vecs=_PAR['vecs'], extra_stats=_PAR['stats'])
+def _par_work(task):
+    cand_sub, s1_slice, s23_slice = task
+    return compute_features(cand_sub, s1_slice, s23_slice, vecs=_PAR['vecs'], extra_stats=_PAR['stats'])
+
+
+def _slice_task(part, df_s1, df_s23):
+    """
+    Self-contained task for one part of the (s1_pos-sorted) candidate chunk: the part with s1_pos / s23_pos
+    remapped to positions in compact copies of the referenced rows. compute_features only ever indexes the
+    frames by these positions (and groups by s1_pos), so the output is identical to the unsliced call.
+    """
+    u1, inv1 = np.unique(part['s1_pos'].values, return_inverse=True)
+    u2, inv2 = np.unique(part['s23_pos'].values, return_inverse=True)
+    sub = part.copy()
+    sub['s1_pos'] = inv1.astype(np.int64)
+    sub['s23_pos'] = inv2.astype(np.int64)
+    s1_slice = df_s1.iloc[u1].reset_index(drop=True)
+    s23_slice = df_s23.iloc[u2].reset_index(drop=True)
+    return sub, s1_slice, s23_slice
+
+
+def split_by_s1_groups(cand_sorted, target_pairs):
+    """Boundaries [a, b) of consecutive parts of ~target_pairs rows that never split an S1 entity's group."""
+    n = len(cand_sorted)
+    s1s = cand_sorted['s1_pos'].values
+    group_starts = np.r_[0, np.flatnonzero(np.diff(s1s)) + 1]
+    n_parts = max(1, min(int(np.ceil(n / max(1, target_pairs))), len(group_starts)))
+    targets = (np.arange(1, n_parts) * n) // n_parts
+    cuts = [0]
+    for t in targets:
+        j = np.searchsorted(group_starts, t)
+        cuts.append(int(group_starts[j]) if j < len(group_starts) else n)
+    cuts.append(n)
+    cuts = sorted(set(cuts))
+    return [(a, b) for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
+
+
+def _pool_size(n_jobs):
+    """Workers allowed by the RAM budget: parent RSS + workers * FEATURE_WORKER_GB + headroom <= TOTAL_RAM_GB."""
+    try:
+        if cfg.TOTAL_RAM_GB > 0:
+            rss = cfg.rss_gb()
+            free = cfg.TOTAL_RAM_GB - rss - cfg.FEATURE_RAM_HEADROOM_GB
+            allowed = max(1, int(free / cfg.FEATURE_WORKER_GB))
+            if allowed < n_jobs:
+                log.info(f"  feature workers capped {n_jobs} -> {allowed} (parent rss {rss:.1f} GB of {cfg.TOTAL_RAM_GB:.0f} GB, "
+                         f"budget {cfg.FEATURE_WORKER_GB:.0f} GB/worker + {cfg.FEATURE_RAM_HEADROOM_GB:.0f} GB headroom)")
+                return allowed
+    except Exception:  # noqa
+        pass
+    return n_jobs
 
 
 def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, n_jobs=1, min_pairs=60000):
     """
-    Same output as compute_features (rows aligned with `cand`), computed by n_jobs forked
-    processes on disjoint S1 groups (group-relative features need every candidate of an S1
-    entity in the same part).  Uses the 'fork' start method so the large frames are shared
-    copy-on-write; on Windows / macOS-spawn it runs serially.
+    Same output as compute_features (rows aligned with `cand`), computed by up to n_jobs forked worker
+    processes on disjoint S1 groups (group-relative features need every candidate of an S1 entity in the
+    same part). Workers get pickled slices (see the memory model above); on Windows / macOS it runs in the
+    main process with rapidfuzz threads.
     """
     import platform
     import multiprocessing as mp
     n = len(cand)
-    # memory-aware pool size: parent RSS + n_workers * FEATURE_WORKER_GB must stay under the RAM limit
-    # (the parent holds ~20-25 GB of frames on the full data; a 9-worker pool on a 50 GB pod is an OOM kill)
-    try:
-        import config as cfg
-        if cfg.TOTAL_RAM_GB > 0:
-            free = cfg.TOTAL_RAM_GB - cfg.rss_gb() - cfg.FEATURE_RAM_HEADROOM_GB
-            allowed = max(1, int(free / cfg.FEATURE_WORKER_GB))
-            if allowed < n_jobs:
-                log.info(f"  feature workers capped {n_jobs} -> {allowed} (rss {cfg.rss_gb():.1f} GB of {cfg.TOTAL_RAM_GB:.0f} GB)")
-                n_jobs = allowed
-    except Exception:  # noqa
-        pass
+    if n_jobs > 1 and n >= min_pairs and platform.system() == 'Linux':
+        n_jobs = _pool_size(n_jobs)
     if n_jobs <= 1 or n < min_pairs or platform.system() != 'Linux':
         return compute_features(cand, df_s1, df_s23, vecs=vecs, extra_stats=extra_stats)
     s1p = cand['s1_pos'].values
     order = np.argsort(s1p, kind='stable')
     cand_sorted = cand.iloc[order].reset_index(drop=True)
-    s1s = cand_sorted['s1_pos'].values
-    group_starts = np.r_[0, np.flatnonzero(np.diff(s1s)) + 1]
-    n_parts = min(n_jobs, len(group_starts))
-    targets = (np.arange(1, n_parts) * n) // n_parts
-    cuts = [0] + [int(group_starts[np.searchsorted(group_starts, t)]) if np.searchsorted(group_starts, t) < len(group_starts) else n
-                  for t in targets] + [n]
-    cuts = sorted(set(cuts))
-    parts = [cand_sorted.iloc[a:b] for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
+    bounds = split_by_s1_groups(cand_sorted, cfg.FEATURE_TASK_PAIRS)
+    n_workers = min(n_jobs, len(bounds))
+    tasks = (_slice_task(cand_sorted.iloc[a:b], df_s1, df_s23) for a, b in bounds)   # lazy: one slice in flight at a time
     ctx = mp.get_context('fork')
     import gc
     gc.collect()
-    gc.freeze()          # inherited objects go to the permanent generation: children never traverse (and dirty) them
+    gc.freeze()          # inherited objects go to the permanent generation: nothing in the parent's heap is traversed later
     try:
-        with ctx.Pool(len(parts), initializer=_par_init, initargs=(df_s1, df_s23, vecs, extra_stats)) as pool:
-            feats = pool.map(_par_work, parts)
+        with ctx.Pool(n_workers, initializer=_par_init, initargs=(vecs, extra_stats)) as pool:
+            feats = list(pool.imap(_par_work, tasks))          # ordered; results stream back as parts finish
     finally:
         gc.unfreeze()
     feat = pd.concat(feats, ignore_index=True)
+    del feats
     inv = np.empty_like(order)
     inv[order] = np.arange(n)
     return feat.iloc[inv].reset_index(drop=True)

@@ -18,7 +18,8 @@ CatBoost and the forked feature workers oversubscribe the 9 vCPU and the run cra
 `CatBoost GPU: OK` means the CUDA path works; if the probe fails, training falls back to CPU automatically
 (1500 iterations, bounded) and the ensemble is kept.
 
-## 1. Quick run — 1 lakh entities (~35-50 min train, ~50-70 min inference)
+## 1. Quick run — 1 lakh entities (~1 h train; inference on the full test ~4.5-5.5 h, blocking-bound:
+## US 10k-S1 chunks take ~2 min each x 66, India ~1 min x 82, France ~0.5 min x 26; features ~1 h at 4-5 workers)
 ```bash
 ER_SAMPLE_S1=100000 nohup python -B train.py > /workspace/train_100k.log 2>&1 &
 tail -f /workspace/train_100k.log
@@ -58,7 +59,8 @@ python utils/validate_submission.py --matching output/matching_results.tsv --can
 ## 5. Switches
 Same as SAGEMAKER_RUNBOOK.md section 4, plus: `ER_RESUME=1` (restart at the model stage from the checkpoint),
 `ER_CHECKPOINT=0` (do not write the ~15 GB checkpoint), `ER_GPU=0/1` (force CatBoost device),
-`ER_CATBOOST_CPU_ITERS` (fallback iterations), `ER_N_JOBS` (pin CPU count).
+`ER_CATBOOST_CPU_ITERS` (fallback iterations), `ER_N_JOBS` (pin CPU count), `ER_FEATURE_WORKERS` (feature-stage
+worker processes, default = jobs, capped by the RAM budget; `1` = main process only).
 
 ## 5b. Incident: BrokenPipeError in ForkPoolWorker-* after "chunk 1/4: 20,000 S1 -> 2,000,000 candidates"
 Workers print `BrokenPipeError` when the parent that owns their result pipe has died — i.e. the parent was
@@ -77,6 +79,21 @@ cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max 2>/dev/null; nproc; free -g
 ```
 If `cpu.max` shows `400000 100000` the pod really has 4 CPUs (the log's `jobs=4`); otherwise set
 `ER_N_JOBS=9` in `/workspace/env.sh`. If `memory.max` is not 50 GB, the config line's `ram=` must match it.
+
+## 5c. Incident 2 (same symptom, 47 GB cgroup): `feature workers capped 9 -> 5` then BrokenPipeError
+Second full run died at Pass B+C US chunk 1/8 with the parent at 26 GB and 5 forked workers. Root cause
+measured, not guessed: a forked worker that reads the parent's frames writes a refcount into every string it
+touches, so each worker copied 4-5 GB of the parent's pages (200k pairs x ~15 object columns), not the 2.5 GB
+budgeted. Fix (commit after `cc27587`): workers no longer touch the parent's frames at all. The parent builds
+each task as a self-contained slice (the pairs plus compact copies of the S1 / S2-S3 rows they reference,
+positions remapped) and sends it pickled, exactly the mechanism `preprocess_dataframe` has used at 9 workers on
+this pod without incident. Measured on 250k pairs: identical output (all 124 columns), 33 MB pickled per 100k
+pairs, ~10k pairs/s per worker. Budget: 3 GB per worker + 6 GB headroom against the live parent RSS (a >3x
+margin), tasks of 100k pairs, `ER_FEATURE_WORKERS=1` forces the main process (~12k pairs/s) if ever wanted.
+Log lines: `feature workers capped 9 -> N (parent rss ...)`. Memory monitor while a run is going:
+```bash
+nohup bash -c 'while true; do echo "$(date +%T) $(cat /sys/fs/cgroup/memory.current 2>/dev/null | awk "{printf \"%.1f GB\", \$1/1e9}")"; sleep 30; done' > /workspace/mem.log 2>&1 &
+```
 
 ## 6. Warnings
 - **Pod restart wipes pip packages**: re-run `setup_runpod.sh --no-smoke` (2 min), then `source /workspace/env.sh`.

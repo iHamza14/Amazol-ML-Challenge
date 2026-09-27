@@ -186,7 +186,7 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
             ids_o = s23_ids_c[s23p[order]]
             for a, b in zip(starts, ends):
                 cand_lists[s1p_o[a]] = ids_o[a:b]
-            feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.N_JOBS)
+            feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.FEATURE_WORKERS)
             X = feat[feat_cols].values.astype(np.float32)
             pm = predict_models(models, X)
             p_max = np.max(np.stack(list(pm.values())), axis=0) if pm else np.zeros(len(X), dtype=np.float32)

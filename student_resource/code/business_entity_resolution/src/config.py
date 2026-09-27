@@ -161,10 +161,17 @@ BLOCK_S1_CHUNK = 10000           # S1 rows per sparse matmul / feature chunk (bo
 # dropped from BOTH sides before the product. Common tokens never decide a record's best S1 but dominate the
 # cost (posting lists of 100k+ rows); measured 19 min per country without pruning on 4 threads.
 REVERSE_MAX_DF_FRAC = float(os.environ.get('ER_REVERSE_MAX_DF', 0.005))
-# forked feature workers: each needs roughly this much RAM (own working set for ~1M/N pairs + copy-on-write
-# pages of the parent it touches); the pool size is capped so that parent + workers stay under TOTAL_RAM_GB
-FEATURE_WORKER_GB = 2.5
+# Feature-stage workers. Two full-data runs on a 47 GB pod were OOM-killed (BrokenPipeError in ForkPoolWorker-*)
+# with the previous design, in which forked workers read the parent's 6M-row frames directly: every string a
+# worker touches gets a refcount write, so each worker copied 4-5 GB of the parent's pages. Workers now receive
+# a pickled copy of ONLY their ~100k-pair slice (the same mechanism preprocess_dataframe has used without
+# incident at 9 workers on this pod) and never touch the shared frames, so a worker costs its own slice plus
+# working set (< 1 GB measured budget below is 3x that). The pool size is still capped by the RAM budget
+# (TOTAL_RAM_GB - parent RSS - headroom) / FEATURE_WORKER_GB.  ER_FEATURE_WORKERS=1 forces the main process.
+FEATURE_WORKERS = int(os.environ.get('ER_FEATURE_WORKERS', N_JOBS))
+FEATURE_WORKER_GB = 3.0
 FEATURE_RAM_HEADROOM_GB = 6.0
+FEATURE_TASK_PAIRS = 100_000      # pairs per worker task (bounds a worker's slice + working set)
 # Reverse channel: every S2/S3 record retrieves its top-k S1 entities (joint vector); the S1's rank in that
 # list is a competition feature and each record's top-1 S1 becomes an extra candidate. Costs one extra
 # sparse product per country (S2/S3 x all S1). Disable with ER_REVERSE=0.

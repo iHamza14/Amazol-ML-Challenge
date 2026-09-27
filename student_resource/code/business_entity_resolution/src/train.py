@@ -307,7 +307,7 @@ def main():
         for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_bc, blocker_cache=blocker_cache):
             if len(cand) == 0:
                 continue
-            feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.N_JOBS)
+            feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.FEATURE_WORKERS)
             if feat_cols is None:
                 feat_cols = feature_columns(feat)
                 log.info(f"  {len(feat_cols)} features: {feat_cols}")

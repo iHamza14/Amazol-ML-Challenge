@@ -105,6 +105,10 @@ def main():
     t = time.time(); b.predict(Xs, num_threads=cfg.N_JOBS); dt_l = time.time() - t
     per_pair_predict += dt_l / rows
     msg = f'lightgbm {rows / dt_l:,.0f} rows/s'
+    # does this container really have more CPUs than N_JOBS? (containers often report the host's cores)
+    t = time.time(); b.predict(Xs, num_threads=2 * cfg.N_JOBS); dt_2 = time.time() - t
+    print(f'  CPU headroom test: lightgbm with {cfg.N_JOBS} threads {rows / dt_l:,.0f} rows/s | with {2 * cfg.N_JOBS} threads '
+          f'{rows / dt_2:,.0f} rows/s -> {"MORE CPUs AVAILABLE: consider ER_N_JOBS=" + str(2 * cfg.N_JOBS) if dt_l / dt_2 > 1.5 else "no gain from more threads"}', flush=True)
     if os.path.exists(os.path.join(cfg.MODEL_DIR, 'catboost.cbm')) and 'catboost' in mcfg.get('models', []):
         from catboost import CatBoostClassifier
         cb = CatBoostClassifier(); cb.load_model(os.path.join(cfg.MODEL_DIR, 'catboost.cbm'))

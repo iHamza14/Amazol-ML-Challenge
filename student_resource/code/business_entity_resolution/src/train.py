@@ -201,7 +201,7 @@ def main():
         perm_t = rng.permutation(pool_train)
         perm_v = rng.permutation(pool_val)
         n_train = min(cfg.TRAIN_S1_ENTITIES, int(0.5 * len(pool_train)))
-        n_stats = min(300000, int(0.75 * n_train), max(0, int(0.8 * len(pool_train)) - n_train))
+        n_stats = min(cfg.STATS_S1_MAX, int(0.75 * n_train), max(0, int(0.8 * len(pool_train)) - n_train))
         n_val_unseen = min(cfg.VAL_S1_ENTITIES, len(pool_val))
         n_val_in = min(cfg.VAL_S1_ENTITIES // 2, len(pool_train) - n_train - n_stats)   # in-country holdout
         train_pos = np.sort(perm_t[:n_train])
@@ -213,7 +213,7 @@ def main():
     else:
         perm = rng.permutation(n_s1)
         n_train = min(cfg.TRAIN_S1_ENTITIES, int(0.6 * n_s1))
-        n_stats = min(300000, int(0.75 * n_train), n_s1 - n_train)
+        n_stats = min(cfg.STATS_S1_MAX, int(0.75 * n_train), n_s1 - n_train)
         n_val = min(cfg.VAL_S1_ENTITIES, int(0.25 * n_train), n_s1 - n_train - n_stats)
         train_pos = np.sort(perm[:n_train])
         stats_pos = np.sort(perm[n_train:n_train + n_stats])
@@ -268,9 +268,9 @@ def main():
         mask_stats = (split == 2) & (s1_country == country)
         truth_total = int(n_true_all[mask_stats].sum())
         true_fused_ranks = []
-        cap = cfg.BLOCK_MAX_CANDIDATES
+        cap = cfg.max_candidates_for(country)
         # labels only (no feature cost): retrieve deeper than the cap so the recall curve is informative above it
-        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_stats, max_candidates=max(150, cap),
+        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_stats, max_candidates=max(200, cap),
                                                       blocker_cache=blocker_cache):
             lab = (owner_c[cand['s23_pos'].values] == cand['s1_pos'].values)
             in_cap = cand['fused_rank'].values < cap
@@ -283,7 +283,7 @@ def main():
         log.info(f"  BLOCKING RECALL at the shipped cap {cap} (stats split, {country}): {rec:.5f}  ({found:,}/{truth_total:,})")
         if true_fused_ranks:
             tfr = np.concatenate(true_fused_ranks)
-            curve = {k: round(float((tfr < k).sum()) / max(1, truth_total), 5) for k in (10, 20, 30, 40, 50, 60, 80, 100, 120, 150)}
+            curve = {k: round(float((tfr < k).sum()) / max(1, truth_total), 5) for k in (10, 20, 30, 40, 50, 60, 80, 100, 120, 150, 200)}
             log.info(f"  recall@K by fused rank ({country}): {curve}")
             recall_stats[f'{country}_recall_at_k'] = curve
         if not keep_s23_cached:
@@ -720,6 +720,7 @@ def model_and_decision(st):
         'keep_prob': float(cfg.DECISION_KEEP_PROB),
         'blocking': {'max_candidates': int(cfg.BLOCK_MAX_CANDIDATES), 'use_reverse': bool(cfg.USE_REVERSE_BLOCKING),
                      'reverse_topk': int(cfg.REVERSE_TOPK), 'topk': dict(cfg.BLOCK_TOPK),
+                     'by_country': dict(cfg.BLOCK_BY_COUNTRY), 'fusion': cfg.BLOCK_FUSION, 'rrf_c': float(cfg.BLOCK_RRF_C),
                      'min_score': float(cfg.BLOCK_MIN_SCORE), 'max_df_frac': float(cfg.BLOCK_MAX_DF_FRAC)},
         'per_bin_thresholds': bool(cfg.PER_BIN_THRESHOLDS),
         'unseen_country': unseen,

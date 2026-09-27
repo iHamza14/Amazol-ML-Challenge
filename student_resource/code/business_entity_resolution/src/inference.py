@@ -136,14 +136,21 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
     blk = mcfg.get('blocking')
     if blk:
         eff_cap = max_candidates or cfg.BLOCK_MAX_CANDIDATES
+        trained_by_country = dict(blk.get('by_country') or {})
         if eff_cap != blk['max_candidates'] or bool(cfg.USE_REVERSE_BLOCKING) != bool(blk['use_reverse']) \
-                or cfg.REVERSE_TOPK != blk.get('reverse_topk', cfg.REVERSE_TOPK) or dict(cfg.BLOCK_TOPK) != dict(blk.get('topk', cfg.BLOCK_TOPK)):
+                or cfg.REVERSE_TOPK != blk.get('reverse_topk', cfg.REVERSE_TOPK) or dict(cfg.BLOCK_TOPK) != dict(blk.get('topk', cfg.BLOCK_TOPK)) \
+                or dict(cfg.BLOCK_BY_COUNTRY) != trained_by_country or cfg.BLOCK_FUSION != blk.get('fusion', 'minrank'):
             log.warning(f"  BLOCKING SETTINGS DIFFER FROM TRAINING: now cap={eff_cap} reverse={cfg.USE_REVERSE_BLOCKING} "
-                        f"topk={dict(cfg.BLOCK_TOPK)} vs trained {blk}. Using the TRAINED settings.")
-            max_candidates = int(blk['max_candidates'])
+                        f"topk={dict(cfg.BLOCK_TOPK)} by_country={dict(cfg.BLOCK_BY_COUNTRY)} vs trained {blk}. Using the TRAINED settings.")
+            cfg.BLOCK_MAX_CANDIDATES = int(blk['max_candidates'])
             cfg.USE_REVERSE_BLOCKING = bool(blk['use_reverse'])
             cfg.REVERSE_TOPK = int(blk.get('reverse_topk', cfg.REVERSE_TOPK))
             cfg.BLOCK_TOPK = dict(blk.get('topk', cfg.BLOCK_TOPK))
+            cfg.BLOCK_BY_COUNTRY = trained_by_country
+            cfg.BLOCK_FUSION = blk.get('fusion', 'minrank')          # models before this option used min-rank fusion
+            cfg.BLOCK_RRF_C = float(blk.get('rrf_c', cfg.BLOCK_RRF_C))
+            # per-country caps come from cfg.max_candidates_for(); a --max-candidates override is dropped
+            max_candidates = None
     keep_prob_trained = float(mcfg.get('keep_prob', KEEP_PROB))
     if abs(keep_prob_trained - KEEP_PROB) > 1e-9:
         log.warning(f"  keep_prob differs from training ({keep_prob_trained} vs {KEEP_PROB}); using the trained value")

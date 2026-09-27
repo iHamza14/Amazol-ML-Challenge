@@ -60,7 +60,10 @@ python utils/validate_submission.py --matching output/matching_results.tsv --can
 Same as SAGEMAKER_RUNBOOK.md section 4, plus: `ER_RESUME=1` (restart at the model stage from the checkpoint),
 `ER_CHECKPOINT=0` (do not write the ~15 GB checkpoint), `ER_GPU=0/1` (force CatBoost device),
 `ER_CATBOOST_CPU_ITERS` (fallback iterations), `ER_N_JOBS` (pin CPU count), `ER_FEATURE_WORKERS` (feature-stage
-worker processes, default = jobs, capped by the RAM budget; `1` = main process only).
+worker processes, default = jobs, capped by the RAM budget; `1` = main process only), `ER_STATS_S1` (cap on the
+stats split; default min(300k, 0.75 x train) — 50000 is plenty and saves ~10 min of blocking per 25k entities),
+`ER_BLOCK_BY_COUNTRY` (JSON per-country blocking overrides, e.g. `'{"india": {"max_candidates": 200, "topk_scale": 2}}'`;
+the trained values are persisted in model_config.json and inference applies them).
 
 ## 5b. Incident: BrokenPipeError in ForkPoolWorker-* after "chunk 1/4: 20,000 S1 -> 2,000,000 candidates"
 Workers print `BrokenPipeError` when the parent that owns their result pipe has died — i.e. the parent was
@@ -94,6 +97,17 @@ Log lines: `feature workers capped 9 -> N (parent rss ...)`. Memory monitor whil
 ```bash
 nohup bash -c 'while true; do echo "$(date +%T) $(cat /sys/fs/cgroup/memory.current 2>/dev/null | awk "{printf \"%.1f GB\", \$1/1e9}")"; sleep 30; done' > /workspace/mem.log 2>&1 &
 ```
+
+## 5d. Blocking depth, fusion and caps (commit after `a9e55ed`)
+The second full run measured blocking recall at cap 100 of US 0.99192 and India 0.97669, far below the 40k-sample
+numbers (candidate collisions grow with the pool). A probe on a 1.24M-record India pool (30% of full scale,
+6,000 queries, 22,090 true matches) showed the base top-k union saturating at ~198 candidates (ceiling 0.9928
+even uncapped), while top-k 250 on every channel with reciprocal-rank fusion reached 0.9928 at cap 150 and
+0.9939 at cap 200 (vs 0.9890 for the old rule at cap 100). Retrieval depth is nearly free (48 s for 6,000
+entities x 5 channels at k=250); the cap sets the feature cost. New defaults: top-k 250 everywhere, RRF fusion,
+cap 150 (US, France) and 200 (India). Inference pairs rise from ~173M to ~300M (+50 min of features at 5
+workers); training pairs ~22M for 1 lakh entities. The trained values are persisted in model_config.json.
+Watch `BLOCKING RECALL at the shipped cap` in Pass A: expect US ≥ 0.994 and India ≥ 0.986 (both were lower before).
 
 ## 6. Warnings
 - **Pod restart wipes pip packages**: re-run `setup_runpod.sh --no-smoke` (2 min), then `source /workspace/env.sh`.

@@ -11,6 +11,7 @@ Environment overrides (all optional):
   ER_SAMPLE_S1   if set (int), train.py only uses this many S1 entities (quick runs)
 """
 import os
+import json
 import platform
 import logging
 import multiprocessing
@@ -140,13 +141,28 @@ RANDOM_SEED = 42
 # Blocking (sparse TF-IDF top-k retrieval, per country)
 # ============================================================
 # Each channel retrieves its own top-k per S1 entity; candidates are the union.
+# Top-k per channel. Retrieval depth is nearly free (the sparse product dominates, not the top-n selection:
+# 6,000 India entities x 5 channels at k=250 against 1.24M records took 48 s on a laptop) while the CAP sets
+# the feature cost, so every channel retrieves deep and the fusion rule decides what enters the cap.
+# Measured on the 1.24M-record India pool (true-match recall within the cap, RRF fusion):
+#   base k (60/40/60/40/80) cap 100: 0.98895 | cap 150: 0.99144      <- the union saturates at ~198 candidates
+#   k=250 all channels      cap 100: 0.99099 | cap 150: 0.99280 | cap 200: 0.99389 | cap 300: 0.99538
+# ER_BLOCK_TOPK=60,40,60,40,80 restores the old depths (order: name_tok,name_chr,addr_tok,addr_num,joint).
+_TOPK_ENV = [int(x) for x in os.environ.get('ER_BLOCK_TOPK', '').split(',') if x.strip()]
 BLOCK_TOPK = {
-    'name_tok': 60,      # word unigrams of core name (IDF weighted)
-    'name_chr': 40,      # char 3-grams of space-less core name (typos, leetspeak, domain-collapse)
-    'addr_tok': 60,      # address words + numbers
-    'addr_num': 40,      # (house-number, street-word) combos -- very precise
-    'joint':    80,      # name + address tokens together (best overall ranking)
+    'name_tok': 250,     # word unigrams of core name (IDF weighted)
+    'name_chr': 250,     # char 3-grams of space-less core name (typos, leetspeak, domain-collapse)
+    'addr_tok': 250,     # address words + numbers
+    'addr_num': 250,     # (house-number, street-word) combos -- very precise
+    'joint':    250,     # name + address tokens together (best overall ranking)
 }
+if len(_TOPK_ENV) == 5:
+    BLOCK_TOPK = dict(zip(['name_tok', 'name_chr', 'addr_tok', 'addr_num', 'joint'], _TOPK_ENV))
+# Fusion of the channel rankings into one candidate order per S1: 'rrf' (reciprocal-rank fusion, sum over
+# channels of 1/(C + rank); the reverse channel's rank r counts as 2r) or 'minrank' (previous rule: best
+# single-channel rank, ties by summed score). RRF won every uniform-k configuration measured (see above).
+BLOCK_FUSION = os.environ.get('ER_BLOCK_FUSION', 'rrf')
+BLOCK_RRF_C = 60.0
 BLOCK_MIN_SCORE = 0.08           # cosine below this is never a candidate
 BLOCK_MAX_DF_FRAC = 0.03         # drop tokens present in > 3% of S23 docs of that country
 # Hard cap per S1 entity after channel union. The union almost always exceeds the cap, so the cap
@@ -154,8 +170,32 @@ BLOCK_MAX_DF_FRAC = 0.03         # drop tokens present in > 3% of S23 docs of th
 # fused rank): US 99.75% @80, 99.80% @100, 99.84% @150; India 99.55% @80, 99.65% @100, 99.75% @150.
 # The tail is empty-address records with garbled names and Indic names with truncated addresses.
 # Keep train == inference.
-BLOCK_MAX_CANDIDATES = int(os.environ.get('ER_MAX_CANDIDATES', 100))
+# Cap 150 (US, France): US recall at full scale was 0.99192 @100 vs 0.99314 @150 with the old fusion.
+BLOCK_MAX_CANDIDATES = int(os.environ.get('ER_MAX_CANDIDATES', 150))
 BLOCK_MAX_CANDIDATES_INFER = BLOCK_MAX_CANDIDATES
+# Per-country overrides. The full-scale run (Sep 27, 75k stats entities) measured blocking recall at cap 100 of
+# US 0.99192 but India 0.97669 (0.98199 @150): the India pool has far more same-name records per S1 than the
+# 40k sample, and every unreachable match is a guaranteed miss. Values: 'max_candidates' (cap) and either
+# 'topk_scale' (multiplies every channel's top-k) or 'topk' (explicit dict). Keys are country_norm values.
+# train.py persists this in model_config.json and inference.py applies the TRAINED values.
+# Override: ER_BLOCK_BY_COUNTRY='{"india": {"max_candidates": 200, "topk_scale": 2.0}}'
+BLOCK_BY_COUNTRY = json.loads(os.environ.get('ER_BLOCK_BY_COUNTRY') or 'null') or {
+    'india': {'max_candidates': 200},      # 0.99389 vs 0.99280 at cap 150 on the India pool (measured above)
+}
+
+
+def topk_for(country):
+    """Per-channel top-k for one country (BLOCK_TOPK scaled or replaced by BLOCK_BY_COUNTRY)."""
+    o = BLOCK_BY_COUNTRY.get(country) or {}
+    if o.get('topk'):
+        return {ch: int(o['topk'].get(ch, BLOCK_TOPK[ch])) for ch in BLOCK_TOPK}
+    sc = float(o.get('topk_scale', 1.0))
+    return {ch: int(round(k * sc)) for ch, k in BLOCK_TOPK.items()}
+
+
+def max_candidates_for(country):
+    o = BLOCK_BY_COUNTRY.get(country) or {}
+    return int(o.get('max_candidates', BLOCK_MAX_CANDIDATES))
 BLOCK_S1_CHUNK = 10000           # S1 rows per sparse matmul / feature chunk (bounds per-worker memory: ~1M pairs)
 # Reverse product (S2/S3 x all S1 of the country): tokens present in more than this fraction of S2/S3 rows are
 # dropped from BOTH sides before the product. Common tokens never decide a record's best S1 but dominate the
@@ -183,6 +223,9 @@ REVERSE_TOPK = 5
 # ============================================================
 TRAIN_S1_ENTITIES = int(os.environ.get('ER_SAMPLE_S1', 400000))  # S1 entities used for training pairs
 VAL_S1_ENTITIES = 120000                                         # S1 entities held out for validation
+# stats split (extra-token statistics + blocking-recall measurement): min(this, 0.75 x train). 50k entities
+# (~5M pairs) already give stable token statistics; each 10k US entities cost ~2 min of blocking on the pod
+STATS_S1_MAX = int(os.environ.get('ER_STATS_S1', 300000))
 NEG_KEEP_ALL_TOP = 25            # always keep the top-N ranked negatives per S1
 NEG_RANDOM_FRAC = 0.35           # keep this fraction of the remaining negatives
 

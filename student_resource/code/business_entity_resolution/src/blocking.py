@@ -285,9 +285,10 @@ class Blocker:
         idx = np.concatenate([np.arange(a, b) for a, b in zip(lo, hi) if b > a])
         return rows, self.rev1_s23[idx].astype(np.int64), self.rev1_score[idx]
 
-    def query(self, s1_df, s1_pos, max_candidates=None):
-        """Return candidate DataFrame for a chunk of S1 rows (one country)."""
+    def query(self, s1_df, s1_pos, max_candidates=None, topk=None):
+        """Return candidate DataFrame for a chunk of S1 rows (one country). topk: channel -> k (default BLOCK_TOPK)."""
         max_candidates = max_candidates or cfg.BLOCK_MAX_CANDIDATES
+        topk = topk or cfg.BLOCK_TOPK
         s1_pos = np.asarray(s1_pos)
         keys_all = []
         per_ch = {}
@@ -296,7 +297,7 @@ class Blocker:
             if A.nnz == 0 or self.BT[ch].shape[0] == 0:
                 per_ch[ch] = None
                 continue
-            C = sp_matmul_topn(A, self.BT[ch], top_n=cfg.BLOCK_TOPK[ch], threshold=cfg.BLOCK_MIN_SCORE,
+            C = sp_matmul_topn(A, self.BT[ch], top_n=int(topk[ch]), threshold=cfg.BLOCK_MIN_SCORE,
                                sort=False, n_threads=self.n_threads)
             C = C.tocoo()
             if C.nnz == 0:
@@ -328,6 +329,7 @@ class Blocker:
         n_ch_hit = np.zeros(n_pairs, dtype=np.int8)
         min_rank = np.full(n_pairs, NO_RANK, dtype=np.int16)
         sum_score = np.zeros(n_pairs, dtype=np.float32)
+        rrf = np.zeros(n_pairs, dtype=np.float32)      # reciprocal-rank fusion: sum over channels of 1/(C + rank)
         for ch in self.channels:
             sc = np.zeros(n_pairs, dtype=np.float32)
             rk = np.full(n_pairs, NO_RANK, dtype=np.int16)
@@ -340,6 +342,7 @@ class Blocker:
                 n_ch_hit[inv] += 1
                 np.minimum(min_rank, rk, out=min_rank)
                 sum_score += sc
+                rrf[inv] += (1.0 / (cfg.BLOCK_RRF_C + rank.astype(np.float32))).astype(np.float32)
             out[f'bs_{ch}'] = sc
             out[f'br_{ch}'] = rk
         row = (keys_u // self.n_s23).astype(np.int64)
@@ -349,10 +352,19 @@ class Blocker:
         else:
             rev_rank = np.full(n_pairs, NO_RANK, dtype=np.int16)
             rev_score = np.zeros(n_pairs, dtype=np.float32)
-        # cap candidates per S1 by (fused rank asc, total score desc); reverse rank r counts like forward rank 2r
-        fused_key = np.minimum(min_rank, np.where(rev_rank < NO_RANK, rev_rank * 2, NO_RANK)).astype(np.int16)
+        # cap candidates per S1. Fusion 'rrf' (default): reciprocal-rank fusion over the channels, the reverse
+        # rank r counting like forward rank 2r, ties by total score. Measured on a 1.24M-record India pool: at
+        # top-k 250 RRF finds 99.28% of true matches within cap 150 vs 99.14% for min-rank fusion (99.39% vs
+        # 99.34% at cap 200); candidates found by several channels rise above single-channel same-name floods.
+        # Fusion 'minrank' (the previous rule): (min channel rank asc, total score desc).
         total = sum_score + rev_score
-        order = np.lexsort((-total, fused_key, row))
+        has_rev = rev_rank < NO_RANK
+        if cfg.BLOCK_FUSION == 'rrf':
+            fused_score = rrf + np.where(has_rev, 1.0 / (cfg.BLOCK_RRF_C + 2.0 * rev_rank.astype(np.float32)), 0.0).astype(np.float32)
+            order = np.lexsort((-total, -fused_score, row))
+        else:
+            fused_key = np.minimum(min_rank, np.where(has_rev, rev_rank * 2, NO_RANK)).astype(np.int16)
+            order = np.lexsort((-total, fused_key, row))
         row_o = row[order]
         starts = np.r_[0, np.flatnonzero(np.diff(row_o)) + 1]
         counts = np.diff(np.r_[starts, len(row_o)])
@@ -433,10 +445,13 @@ def iter_candidate_chunks(df_s1, df_s23, chunk_size=None, max_candidates=None, s
                               s1_pos_country=s1_pos_country, reverse_k=rev_k)
             if blocker_cache is not None:
                 blocker_cache[country] = blocker
+        cap_c = max_candidates or cfg.max_candidates_for(country)
+        topk_c = cfg.topk_for(country)
+        log.info(f"  blocking settings for {country}: cap={cap_c} topk={topk_c}")
         n_chunks = math.ceil(len(s1_pos_all) / chunk_size)
         for ci in range(n_chunks):
             pos = s1_pos_all[ci * chunk_size:(ci + 1) * chunk_size]
-            cand = blocker.query(df_s1.iloc[pos], pos, max_candidates=max_candidates)
+            cand = blocker.query(df_s1.iloc[pos], pos, max_candidates=cap_c, topk=topk_c)
             log.info(f"  chunk {ci + 1}/{n_chunks}: {len(pos):,} S1 -> {len(cand):,} candidates "
                      f"({len(cand) / max(1, len(pos)):.1f}/S1)")
             yield country, cand, blocker

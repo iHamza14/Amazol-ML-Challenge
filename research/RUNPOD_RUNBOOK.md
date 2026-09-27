@@ -113,6 +113,21 @@ cap 150 (US, France) and 200 (India). Inference pairs rise from ~173M to ~300M (
 workers); training pairs ~22M for 1 lakh entities. The trained values are persisted in model_config.json.
 Watch `BLOCKING RECALL at the shipped cap` in Pass A: expect US ≥ 0.994 and India ≥ 0.986 (both were lower before).
 
+## 5e. Second pod (L40S, 16 vCPU, 188 GB RAM, 50 GB container disk, no network volume assumed)
+Nothing in the code is tied to the 47 GB pod: CPUs and RAM are read from the cgroup, every pool is sized from the
+live budget, GPU from nvidia-smi. On this pod all 16 workers run in every stage and the S2/S3 frames stay cached
+between passes (auto when RAM >= 45 GB). Expect: blocking ~2x faster (sparse products use 16 threads), features
+~100k pairs/s, LightGBM on 23M rows ~10 min, CatBoost GPU ~10 min. Recommended final run:
+`ER_SAMPLE_S1=300000 ER_STATS_S1=60000` (~1.5 h training; matrices ~18 GB; checkpoint ~20 GB on disk).
+Fresh setup on a pod (dataset copied pod-to-pod with scp over the exposed TCP port, see section 5e in the chat log):
+```bash
+cd /workspace && git clone -q --branch runpod https://github.com/iHamza14/Amazol-ML-Challenge.git code
+python -m pip install -q -r /workspace/code/student_resource/code/business_entity_resolution/requirements.txt
+cat > /workspace/env.sh <<'EOS'
+export DATA_ROOT=/workspace/dataset PROJECT_ROOT=/workspace/er_project ER_N_JOBS=16 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
+EOS
+```
+
 ## 6. Warnings
 - **Pod restart wipes pip packages**: re-run `setup_runpod.sh --no-smoke` (2 min), then `source /workspace/env.sh`.
 - **Do not run two trainings at once** on 50 GB.

@@ -26,7 +26,8 @@ for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
 # Environment Detection
 # ============================================================
 IS_SAGEMAKER = os.path.exists('/home/ec2-user/SageMaker')
-IS_RUNPOD = os.path.isdir('/workspace') and not IS_SAGEMAKER
+# RunPod sets RUNPOD_POD_ID; pods without a network volume may still mount /workspace on the container disk
+IS_RUNPOD = (bool(os.environ.get('RUNPOD_POD_ID')) or os.path.isdir('/workspace')) and not IS_SAGEMAKER
 IS_WINDOWS = platform.system() == 'Windows'
 _HERE = os.path.dirname(os.path.abspath(__file__))
 

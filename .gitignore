@@ -22,9 +22,11 @@ build/
 
 # Dataset and Outputs
 dataset/
+Dataset ML Amazon/
 output/
 student_resource/output/
 student_resource/dataset/
+*.pdf
 
 # Jupyter Notebooks
 .ipynb_checkpoints

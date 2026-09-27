@@ -56,14 +56,26 @@ number relations · extra-token stats · legal-form relation · same-name count 
 reverse channel · density-adjusted per-bin thresholds · consensus option · conflict resolution ·
 France calibration · guardrails · error analysis · validator run.
 
-Not done, in expected-value order (each is < 1 h if time remains after the first SageMaker run):
-1. **LOCO proxy for France** (train US only, score India): measures the unseen-country threshold shift directly; compare with the calibrated France threshold from the guardrail. (`train.py` split by country: ~30 lines.)
-2. **Isotonic calibration per country** of the ensemble on the validation split, then re-run the expected-F selection (it was 0.002 behind thresholds uncalibrated).
-3. **Size-adaptive acceptance** (Foursquare 4th): require a higher probability for the 2nd/3rd… link of an entity.
-4. **Extra name comparators**: SoftTFIDF, Monge-Elkan, LCS/common-substring counts, double-metaphone intersection, prefix/postfix similarity, acronym match (`cpam` vs `caisse primaire …`), elision split for French (`l'atelier` → `atelier`).
-5. **Sibling expansion** (harshgitty58): for low-confidence records, propose the S1 of confidently matched records sharing house-number+street.
-6. **Candidate-set reduction for the audit**: a light pruner to ≤ 25 candidates per S1 for `candidate_pairs.tsv` (recall@20 is already 99.6-99.8 %).
-7. Dense channel (multilingual-e5-small, MIT) as a union channel — only if a per-stratum recall report shows misses concentrated in Indic/empty-address rows.
+Done in optimization round 1 (commit ec4c0cb and the review-fix commit that follows): LOCO mode
+(`ER_LOCO`), per-country isotonic calibration + expected-F0.5 as an evaluated alternative, size-adaptive
+acceptance (evaluated per delta), LCS/Indel/postfix/consonant-skeleton/SoftTFIDF-coverage/acronym
+comparators, short-vs-long token edit counts, out-of-vocabulary fraction, S1 same-name counts, French
+elisions, Telangana↔Andhra Pradesh alias, plus 27 code-review fixes (hyphenated French regions, domain
+truncation of single-token names, legal sigles as identity tokens, subsampling reweighting, KEEP_PROB
+alignment, persisted blocking settings, validator memory, ...).
+
+Measured on the 40k-entity local sample (20k training entities): baseline 0.98738 plain /
+0.98542 density-adjusted; with the error-analysis features 0.98697 / 0.98469 (missed matches
+−47 entities, empty-address false positives +22 — a re-balancing inside the inherently ambiguous
+empty-address bin, within noise at this size). The 100k SageMaker run decides; `ER_DROP_FEATURES`
+allows a clean ablation.
+
+Not done, in expected-value order:
+1. **Sibling expansion** (harshgitty58): for low-confidence records, propose the S1 of confidently matched records sharing house-number+street.
+2. **Validation faithfulness for cross-split owners**: false positives on rows owned by a non-validation S1 (13-25 of ~100) would be resolved at inference by the owner's own claim; scoring them as errors biases the sweep towards conservatism. Fix: also score the owner's pair for those rows.
+3. **Candidate-set reduction for the audit**: a light pruner to ≤ 25 candidates per S1 for `candidate_pairs.tsv` (recall@20 is already 99.2-99.5 %).
+4. **Reverse channel on char-3-grams for empty-address records** (3.4 % of S2/S3): the remaining blocking tail is garbled names without an address; a name-only reverse retrieval restricted to those rows is cheap.
+5. Dense channel (multilingual-e5-small, MIT) as a union channel — only if a per-stratum recall report shows misses concentrated in Indic/empty-address rows.
 
 ## 4. Traps other teams fell into
 * Random negatives instead of blocking-generated hard negatives → local 0.988, LB 0.42.

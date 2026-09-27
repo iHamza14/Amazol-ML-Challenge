@@ -77,9 +77,11 @@ BLOCK_TOPK = {
 BLOCK_MIN_SCORE = 0.08           # cosine below this is never a candidate
 BLOCK_MAX_DF_FRAC = 0.03         # drop tokens present in > 3% of S23 docs of that country
 # Hard cap per S1 entity after channel union. The union almost always exceeds the cap, so the cap
-# directly sets feature cost (pairs = S1 x cap). train.py logs recall@K by fused rank on the stats
-# split; raise the cap only if recall@80 is materially below recall@150. Keep train == inference.
-BLOCK_MAX_CANDIDATES = int(os.environ.get('ER_MAX_CANDIDATES', 80))
+# directly sets feature cost (pairs = S1 x cap). Measured on a 40k-entity sample (true-pair recall by
+# fused rank): US 99.75% @80, 99.80% @100, 99.84% @150; India 99.55% @80, 99.65% @100, 99.75% @150.
+# The tail is empty-address records with garbled names and Indic names with truncated addresses.
+# Keep train == inference.
+BLOCK_MAX_CANDIDATES = int(os.environ.get('ER_MAX_CANDIDATES', 100))
 BLOCK_MAX_CANDIDATES_INFER = BLOCK_MAX_CANDIDATES
 BLOCK_S1_CHUNK = 20000           # S1 rows per sparse matmul chunk (memory bound)
 # Reverse channel: every S2/S3 record retrieves its top-k S1 entities (joint vector); the S1's rank in that
@@ -107,10 +109,13 @@ LGBM_PARAMS = dict(
 LGBM_ROUNDS = 4000
 LGBM_EARLY_STOP = 150
 USE_CATBOOST = os.environ.get('ER_NO_CATBOOST', '0') != '1'   # second model for the ensemble
+import shutil as _shutil
+# GPU decided by hardware presence (nvidia-smi), overridable with ER_GPU=1/0 — not by the SageMaker path
+HAS_GPU = (os.environ.get('ER_GPU') == '1') or (os.environ.get('ER_GPU') != '0' and _shutil.which('nvidia-smi') is not None)
 CATBOOST_PARAMS = dict(iterations=4000, learning_rate=0.06, depth=8, l2_leaf_reg=3.0,
                        loss_function='Logloss', eval_metric='Logloss', random_seed=RANDOM_SEED,
                        od_type='Iter', od_wait=150, verbose=200,
-                       task_type='GPU' if IS_SAGEMAKER else 'CPU')
+                       task_type='GPU' if HAS_GPU else 'CPU')
 ENSEMBLE_WEIGHTS = {'lgbm': 0.5, 'catboost': 0.5}
 
 # ============================================================
@@ -129,6 +134,8 @@ UNSEEN_MAX_THRESHOLD = 0.97
 # this ratio when selecting thresholds so validation tracks the leaderboard instead of overstating it.
 TEST_DISTRACTOR_RATIO = float(os.environ.get('ER_DISTRACTOR_RATIO', 1.9))
 SINGLETON_FLOOR = 0.0                    # legacy; decision uses thresholds directly
+DECISION_KEEP_PROB = 0.02                # pairs below this max-model probability never reach the decision layer
+                                         # (applied identically in train.py validation and inference.py)
 RESOLVE_S23_CONFLICTS = True             # each S2/S3 record belongs to at most one S1 entity
 USE_EXPECTED_F05 = True                  # compare threshold rule vs expected-F0.5 set selection on val
 USE_CONSENSUS = True                     # also evaluate min(model probs) instead of the mean (precision filter)

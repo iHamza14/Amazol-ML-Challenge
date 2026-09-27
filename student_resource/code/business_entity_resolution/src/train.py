@@ -86,10 +86,20 @@ class ExtraTokenAccumulator:
         return ExtraTokenStats(table, prior=prior, alpha=alpha)
 
 
-def subsample_negatives(label, min_rank, rng):
-    keep = label.astype(bool) | (min_rank < cfg.NEG_KEEP_ALL_TOP)
+def subsample_negatives(label, fused_rank, rng):
+    """
+    Keep all positives, all candidates within the top-N of the S1's fused ranking (the hard negatives),
+    and a random NEG_RANDOM_FRAC of the deeper negatives. Returns (keep_mask, sample_weight) where the
+    randomly kept deep negatives get weight 1/NEG_RANDOM_FRAC so the models still estimate the full-pool
+    probability (otherwise deep-rank pairs would look 1/frac more likely to match than they are).
+    """
+    pos = label.astype(bool)
+    top = fused_rank < cfg.NEG_KEEP_ALL_TOP
     rnd = rng.random(len(label)) < cfg.NEG_RANDOM_FRAC
-    return keep | rnd
+    keep = pos | top | rnd
+    w = np.ones(len(label), dtype=np.float32)
+    w[~pos & ~top & rnd] = 1.0 / cfg.NEG_RANDOM_FRAC
+    return keep, w
 
 
 # ------------------------------------------------------------------
@@ -187,7 +197,7 @@ def main():
     countries = pd.unique(s1_country)
 
     acc = ExtraTokenAccumulator()
-    train_X, train_y, train_meta = [], [], []
+    train_X, train_y, train_w, train_meta = [], [], [], []
     val_X, val_y, val_meta = [], [], []
     feat_cols = None
     recall_stats = {}
@@ -217,18 +227,21 @@ def main():
         mask_stats = (split == 2) & (s1_country == country)
         truth_total = int(n_true_all[mask_stats].sum())
         true_fused_ranks = []
-        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_stats):
+        cap = cfg.BLOCK_MAX_CANDIDATES
+        # labels only (no feature cost): retrieve deeper than the cap so the recall curve is informative above it
+        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_stats, max_candidates=max(150, cap)):
             lab = (owner_c[cand['s23_pos'].values] == cand['s1_pos'].values)
-            found += int(lab.sum())
+            in_cap = cand['fused_rank'].values < cap
+            found += int((lab & in_cap).sum())
             true_fused_ranks.append(cand['fused_rank'].values[lab])
-            acc.add(df_s1['name_core'].values[cand['s1_pos'].values].tolist(),
-                    df_s23_c['name_core'].values[cand['s23_pos'].values].tolist(), lab)
+            acc.add(df_s1['name_core'].values[cand['s1_pos'].values[in_cap]].tolist(),
+                    df_s23_c['name_core'].values[cand['s23_pos'].values[in_cap]].tolist(), lab[in_cap])
         rec = found / max(1, truth_total)
         recall_stats[country] = rec
-        log.info(f"  BLOCKING RECALL (stats split, {country}): {rec:.5f}  ({found:,}/{truth_total:,})")
+        log.info(f"  BLOCKING RECALL at the shipped cap {cap} (stats split, {country}): {rec:.5f}  ({found:,}/{truth_total:,})")
         if true_fused_ranks:
             tfr = np.concatenate(true_fused_ranks)
-            curve = {k: round(float((tfr < k).sum()) / max(1, truth_total), 5) for k in (10, 20, 30, 40, 50, 60, 80, 100, 150)}
+            curve = {k: round(float((tfr < k).sum()) / max(1, truth_total), 5) for k in (10, 20, 30, 40, 50, 60, 80, 100, 120, 150)}
             log.info(f"  recall@K by fused rank ({country}): {curve}")
             recall_stats[f'{country}_recall_at_k'] = curve
         if not keep_s23_cached:
@@ -244,10 +257,12 @@ def main():
         owner_c = build_owner_array(df_s23_c, s23_owner_s1pos)
         s23_ids_arr = df_s23_c['entity_id'].values
 
-        # ---------- Pass B: train split ----------
-        log.info(f"--- Pass B (train split) country={country} ---")
-        mask_train = (split == 1) & (s1_country == country)
-        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_train):
+        # ---------- Pass B+C: train and val splits in ONE blocking pass (one Blocker build per country) ----------
+        # Features are per pair and group features are per S1 entity, so routing a chunk's rows by the split of
+        # their S1 is exact.
+        log.info(f"--- Pass B+C (train + val splits) country={country} ---")
+        mask_bc = ((split == 1) | (split == 3)) & (s1_country == country)
+        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_bc):
             if len(cand) == 0:
                 continue
             feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.N_JOBS)
@@ -255,29 +270,26 @@ def main():
                 feat_cols = feature_columns(feat)
                 log.info(f"  {len(feat_cols)} features: {feat_cols}")
             lab = (owner_c[cand['s23_pos'].values] == cand['s1_pos'].values).astype(np.int8)
-            keep = subsample_negatives(lab, cand['min_rank'].values, rng)
-            train_X.append(feat.loc[keep, feat_cols].values.astype(FEAT_DTYPE))
-            train_y.append(lab[keep])
-            train_meta.append(pd.DataFrame({'s1_pos': cand['s1_pos'].values[keep], 'country': country}))
-            del feat
-        # ---------- Pass C: val split ----------
-        log.info(f"--- Pass C (val split) country={country} ---")
-        mask_val = (split == 3) & (s1_country == country)
-        for _, cand, blocker in iter_candidate_chunks(df_s1, df_s23_c, s1_mask=mask_val):
-            if len(cand) == 0:
-                continue
-            feat = compute_features_parallel(cand, df_s1, df_s23_c, vecs=blocker.vec, extra_stats=extra_stats, n_jobs=cfg.N_JOBS)
-            if feat_cols is None:          # (LOCO: the validation country may come before any training chunk)
-                feat_cols = feature_columns(feat)
-            lab = (owner_c[cand['s23_pos'].values] == cand['s1_pos'].values).astype(np.int8)
-            val_X.append(feat[feat_cols].values.astype(FEAT_DTYPE))
-            val_y.append(lab)
-            val_meta.append(pd.DataFrame({
-                's1_pos': cand['s1_pos'].values, 's23_id': s23_ids_arr[cand['s23_pos'].values],
-                'country': country, 'st_tset': feat['st_tset'].values, 'num_first_rel': feat['num_first_rel'].values,
-                's23_distractor': (owner_c[cand['s23_pos'].values] < 0),
-                'addr_empty_s23': feat['f_addr_empty_s23'].values.astype(bool),
-            }))
+            row_split = split[cand['s1_pos'].values]
+            is_tr = row_split == 1
+            is_va = row_split == 3
+            if is_tr.any():
+                keep, w_sub = subsample_negatives(lab, cand['fused_rank'].values, rng)
+                keep &= is_tr
+                train_X.append(feat.loc[keep, feat_cols].values.astype(FEAT_DTYPE))
+                train_y.append(lab[keep])
+                train_w.append(w_sub[keep])
+                train_meta.append(pd.DataFrame({'s1_pos': cand['s1_pos'].values[keep], 'country': country}))
+            if is_va.any():
+                val_X.append(feat.loc[is_va, feat_cols].values.astype(FEAT_DTYPE))
+                val_y.append(lab[is_va])
+                val_meta.append(pd.DataFrame({
+                    's1_pos': cand['s1_pos'].values[is_va], 's23_id': s23_ids_arr[cand['s23_pos'].values[is_va]],
+                    'country': country, 'st_tset': feat['st_tset'].values[is_va],
+                    'num_first_rel': feat['num_first_rel'].values[is_va],
+                    's23_distractor': (owner_c[cand['s23_pos'].values[is_va]] < 0),
+                    'addr_empty_s23': feat['f_addr_empty_s23'].values[is_va].astype(bool),
+                }))
             del feat
         preprocessed_s23.pop(country, None)
         del df_s23_c, owner_c
@@ -288,6 +300,7 @@ def main():
 
     X_tr = np.concatenate(train_X)
     y_tr = np.concatenate(train_y)
+    w_sub_all = np.concatenate(train_w).astype(np.float32)
     meta_tr = pd.concat(train_meta, ignore_index=True)
     X_va = np.concatenate(val_X)
     y_va = np.concatenate(val_y)
@@ -299,20 +312,26 @@ def main():
 
     # ---------- France-robustness masking: hide extra-token vocabulary for 15% of rows ----------
     col_idx = {c: i for i, c in enumerate(feat_cols)}
-    m = rng.random(len(X_tr)) < 0.15
+    # only rows that HAVE extra tokens can be in the 'unknown vocabulary' regime at inference (France)
+    has_extra = X_tr[:, col_idx['x_extra_cnt']] > 0
+    m = has_extra & (rng.random(len(X_tr)) < 0.25)
     X_tr[np.ix_(m, [col_idx['x_extra_min'], col_idx['x_extra_mean']])] = extra_stats.prior
     X_tr[m, col_idx['x_extra_known']] = 0.0
+    log.info(f"  France-robustness masking applied to {int(m.sum()):,} of {int(has_extra.sum()):,} rows with extra tokens")
 
     # ---------------- 9. models ----------------
     log.info("=" * 70)
     log.info("STEP 9: training models")
     import lightgbm as lgb
-    w_tr = None
+    # sample weights: subsampled deep negatives are up-weighted (1/NEG_RANDOM_FRAC) so probabilities stay
+    # calibrated to the full candidate pool; macro weights (optional) multiply on top
+    w_tr = w_sub_all.copy()
     if cfg.MACRO_WEIGHTS:
         # macro metric: every entity counts once -> positive pairs weighted 1/(true matches of the entity)
         nt = np.maximum(1, n_true_all[meta_tr['s1_pos'].values]).astype(np.float32)
-        w_tr = np.where(y_tr > 0, 1.0 / nt, 1.0).astype(np.float32)
+        w_tr *= np.where(y_tr > 0, 1.0 / nt, 1.0).astype(np.float32)
         log.info(f"  macro sample weights on (mean positive weight {w_tr[y_tr > 0].mean():.3f})")
+    log.info(f"  sample weights: {int((w_tr > 1).sum()):,} deep negatives x{1.0 / cfg.NEG_RANDOM_FRAC:.1f}")
     dtrain = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, feature_name=feat_cols, free_raw_data=False)
     dval = lgb.Dataset(X_va, label=y_va, reference=dtrain, free_raw_data=False)
     params = dict(cfg.LGBM_PARAMS)
@@ -350,6 +369,14 @@ def main():
     # ---------------- 10. decision layer ----------------
     log.info("=" * 70)
     log.info("STEP 10: decision layer selection on validation (density-adjusted)")
+    # mimic inference exactly: only pairs whose max-model probability >= DECISION_KEEP_PROB reach the decision layer
+    p_max_va = np.max(np.stack([probs[k] for k in probs]), axis=0)
+    keep_va = p_max_va >= cfg.DECISION_KEEP_PROB
+    log.info(f"  decision layer sees {int(keep_va.sum()):,} of {len(keep_va):,} validation pairs (max-model prob >= {cfg.DECISION_KEEP_PROB})")
+    meta_va = meta_va.loc[keep_va].reset_index(drop=True)
+    y_va = y_va[keep_va]
+    prob = prob[keep_va]
+    probs = {k: p[keep_va] for k, p in probs.items()}
     val_s1_pos = meta_va['s1_pos'].values
     codes_of_pos = -np.ones(n_s1, dtype=np.int64)
     codes_of_pos[val_pos] = np.arange(len(val_pos))
@@ -563,7 +590,8 @@ def main():
     log.info(f"    false-positive pairs: on unmatched distractor rows={fp_distractor:,}  on rows owned by another S1={fp_other:,}")
     val_out = meta_va[['s1_pos', 's23_id', 'country', 'st_tset', 'num_first_rel', 's23_distractor', 'addr_empty_s23']].copy()
     val_out['s1_id'] = df_s1['entity_id'].values[val_s1_pos]
-    val_out['prob'] = prob.astype(np.float32)
+    val_out['prob'] = P_best.astype(np.float32)          # the probability the selected decision actually used
+    val_out['prob_mean'] = prob.astype(np.float32)
     for k, p in probs.items():
         val_out[f'prob_{k}'] = p.astype(np.float32)
     val_out['label'] = lab
@@ -576,25 +604,33 @@ def main():
         val_out.to_csv(val_path, index=False)
     log.info(f"  validation predictions saved -> {val_path}")
 
-    # unseen-country (France) settings: start at mean seen main threshold + shift, then label-free calibration
-    main_ts = [v for k, v in best['thresholds'].items() if '|' not in k] or [best['default_threshold']]
-    noaddr_deltas = [best['thresholds'][k] - best['thresholds'][k.split('|')[0]] for k in best['thresholds'] if '|' in k and k.split('|')[0] in best['thresholds']]
-    unseen = {
-        'start_threshold': float(np.mean(main_ts) + cfg.UNSEEN_COUNTRY_THRESHOLD_SHIFT),
-        'target_singleton_rate': float(cfg.UNSEEN_TARGET_SINGLETON_RATE),
-        'max_threshold': float(cfg.UNSEEN_MAX_THRESHOLD),
-        'noaddr_delta': float(np.mean(noaddr_deltas)) if noaddr_deltas else 0.0,
-    }
     # observed empty rate on validation per country at the selected decision (sanity reference for inference)
     empty_rate_val = {c: float((n_pred[country_of_code == c] == 0).mean()) for c in pd.unique(country_of_code)}
     mean_links_val = {c: float(n_pred[country_of_code == c].mean()) for c in pd.unique(country_of_code)}
     log.info(f"  validation predicted-empty rate {empty_rate_val} | mean links {mean_links_val} | GT singleton rate {float(is_single.mean()):.4f}")
+    # unseen-country (France) settings: start at mean seen main threshold + shift, then label-free calibration.
+    # The F0.5-optimal decision predicts empty for MORE entities than the true singleton share (precision-weighted
+    # metric), so the calibration target is the seen countries' predicted-empty rate, floored by the GT share.
+    main_ts = [v for k, v in best['thresholds'].items() if '|' not in k] or [best['default_threshold']]
+    noaddr_deltas = [best['thresholds'][k] - best['thresholds'][k.split('|')[0]] for k in best['thresholds'] if '|' in k and k.split('|')[0] in best['thresholds']]
+    unseen = {
+        'start_threshold': float(np.mean(main_ts) + cfg.UNSEEN_COUNTRY_THRESHOLD_SHIFT),
+        'target_singleton_rate': float(max(cfg.UNSEEN_TARGET_SINGLETON_RATE, np.mean(list(empty_rate_val.values())))),
+        'max_threshold': float(cfg.UNSEEN_MAX_THRESHOLD),
+        'noaddr_delta': float(np.mean(noaddr_deltas)) if noaddr_deltas else 0.0,
+    }
+    log.info(f"  unseen-country settings: {unseen}")
 
     config_out = {
         'feature_cols': feat_cols,
         'models': list(probs.keys()),
         'ensemble_weights': w,
         'decision': best,
+        'seen_countries': sorted(str(c) for c in pd.unique(country_of_code)),
+        'keep_prob': float(cfg.DECISION_KEEP_PROB),
+        'blocking': {'max_candidates': int(cfg.BLOCK_MAX_CANDIDATES), 'use_reverse': bool(cfg.USE_REVERSE_BLOCKING),
+                     'reverse_topk': int(cfg.REVERSE_TOPK), 'topk': dict(cfg.BLOCK_TOPK),
+                     'min_score': float(cfg.BLOCK_MIN_SCORE), 'max_df_frac': float(cfg.BLOCK_MAX_DF_FRAC)},
         'per_bin_thresholds': bool(cfg.PER_BIN_THRESHOLDS),
         'unseen_country': unseen,
         'unseen_country_threshold': unseen['start_threshold'],

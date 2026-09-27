@@ -79,7 +79,9 @@ class SparseVectorizer:
         r_u = pair_u // len(uniques)
         c_u = pair_u % len(uniques)
         df = np.bincount(c_u, minlength=len(uniques))
-        max_df = max(self.min_df, int(self.max_df_frac * n_docs))
+        # floor the DF cap in documents: for tiny country groups int(0.03*n) would be 1 and every token
+        # shared by two records (i.e. the matching ones) would be pruned
+        max_df = max(self.min_df, int(self.max_df_frac * n_docs), 50)
         keep = (df >= self.min_df) & (df <= max_df)
         new_index = -np.ones(len(uniques), dtype=np.int64)
         new_index[keep] = np.arange(int(keep.sum()))
@@ -123,10 +125,20 @@ class SparseVectorizer:
 # ------------------------------------------------------------------
 # Document builders for each channel
 # ------------------------------------------------------------------
+_GRAM_CACHE = {}
+
+
 def _char_ngrams(s, n=3):
+    """Char n-grams with interned strings: 6M names x 17 grams would otherwise be 100M Python str objects;
+    only ~30k distinct trigrams exist, so the cache keeps a single object per gram (pointers only)."""
     if len(s) < n:
         return [s] if s else []
-    return [s[i:i + n] for i in range(len(s) - n + 1)]
+    c = _GRAM_CACHE
+    out = []
+    for i in range(len(s) - n + 1):
+        g = s[i:i + n]
+        out.append(c.setdefault(g, g))
+    return out
 
 
 def channel_docs(df, channel):

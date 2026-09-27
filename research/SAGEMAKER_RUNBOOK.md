@@ -30,9 +30,10 @@ rows are still indexed, so blocking is realistic). The stats split (extra-token 
 validation split scale with it (75% / 25% of it, capped at 300k / 120k).
 
 Read these lines in the log:
-- `BLOCKING RECALL (stats split, us|india)` and `recall@K by fused rank` — recall at K=80 (the
-  default cap) vs 150. If recall@80 is more than ~0.001 below recall@150, rerun with
-  `ER_MAX_CANDIDATES=120` (costs 1.5x feature time).
+- `BLOCKING RECALL (stats split, us|india)` and `recall@K by fused rank` — the default cap is 100
+  (measured on a 40k sample: US 99.75% @80 / 99.80% @100 / 99.84% @150, India 99.55 / 99.65 / 99.75).
+  The tail beyond 100 is empty-address records with garbled names, which mostly fall below the
+  empty-address threshold anyway; `ER_MAX_CANDIDATES=150` costs 1.5x feature time for ~+0.05-0.1% recall.
 - `TRAIN matrix ... VAL matrix ...`, `lgbm/catboost/ensemble: val logloss / auc`.
 - `[mean] ... group thresholds {...}`, `+ conflict resolution`, `expected-F0.5 (...)`, `[min] ...`
   (consensus of the two models), `SELECTED decision config`, then
@@ -48,7 +49,13 @@ Read these lines in the log:
 nohup python inference.py > ../../../infer.log 2>&1 &
 tail -f ../../../infer.log
 ```
-Ends with the official validator (`PASS`). Read:
+Ends with the official validator run on `matching_results.tsv` (`PASS`). The candidate-file cross-check is
+skipped inside inference to save ~20 GB (the subset property is enforced in code); run it separately once:
+```bash
+cd /home/ec2-user/SageMaker/Amazol-ML-Challenge/student_resource
+python utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir /home/ec2-user/SageMaker/dataset/test
+```
+Read:
 - `unseen country 'france': start threshold X -> calibrated Y (predicted-empty rate ..., target 0.0559)`:
   France's threshold is raised from the seen-country mean until France's empty rate hits the known
   singleton share. If Y hit the 0.97 cap, France is over-matching badly — inspect a sample of France
@@ -67,13 +74,14 @@ nohup python train.py > ../../../train_full.log 2>&1 &     # default ER_SAMPLE_S
 | Variable | Default | Effect |
 |---|---|---|
 | `ER_SAMPLE_S1` | 400000 | S1 entities used for training pairs |
-| `ER_MAX_CANDIDATES` | 80 | candidate cap per S1 (train and inference; keep identical) |
+| `ER_MAX_CANDIDATES` | 100 | candidate cap per S1 (train and inference; keep identical) |
 | `ER_N_JOBS` | all cores | preprocessing processes / feature-computation processes / LightGBM threads |
 | `ER_NO_CATBOOST=1` | off | LightGBM only (faster; CatBoost GPU adds ~5-10 min and a small ensemble gain) |
 | `ER_REVERSE=0` | on | disable the reverse channel (each S2/S3 record's top-5 S1 as rank feature + extra candidate); saves one S2/S3 x S1 sparse product per country (~5-15 min each at full scale) |
 | `ER_DISTRACTOR_RATIO` | 1.9 | false-positive weight on unmatched rows during threshold selection (test pool density) |
-| `ER_LOCO=us` | off | leave-one-country-out experiment: train on US only, validate on India as an UNSEEN country (France proxy). The log line `LOCO us->india: seen-threshold ... | calibrated ... | oracle ...` tells you how much the France calibration recovers. Run once with `ER_SAMPLE_S1=100000`; do not use its models for the submission. |
+| `ER_LOCO=us` | off | leave-one-country-out experiment: train on US only, validate on India as an UNSEEN country (France proxy). The log line `LOCO us->india: seen-threshold t: F0.5=a empty=.. links=.. | calibrated t': F0.5=b | oracle t*: F0.5=c` shows the unseen-country score with the seen threshold (a), after the label-free calibration (b) and with the best possible threshold (c). If b ≈ c the France calibration is doing its job; if a ≈ b ≈ c but all are far below the in-country score, the gap is per-pair model error in the unseen domain (only more robust features help, not thresholds). Run once with `ER_SAMPLE_S1=100000`; do not use its models for the submission. On a 6k-entity micro sample: in-country 0.994, unseen 0.978, all three thresholds within 0.001. |
 | `ER_MACRO_WEIGHTS=1` | off | weight positive pairs by 1/(true matches of the entity) so the loss follows the macro metric; compare `VAL macro-F0.5 density-adjusted` with and without |
+| `ER_DROP_FEATURES=a,b` | none | ablation switch: drop named features in train and inference (e.g. `x_oov_s23,s23_core_s1_count`). On the 40k local sample the error-analysis features moved loss between missed matches (-47 entities) and empty-address false positives (+22) for a net -0.0007; the 100k run decides |
 
 The decision selection also evaluates (and logs) size-adaptive acceptance (`size-adaptive delta=...`: 2nd+ links
 of an entity need a higher probability) and isotonic-calibrated expected-F0.5 (`CALIBRATED expected-F0.5`);

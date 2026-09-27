@@ -429,7 +429,7 @@ def compute_features(cand, df_s1, df_s23, vecs=None, extra_stats=None):
     F['x_oov_s1'] = g1('name_oov_frac').astype(np.float32) if 'name_oov_frac' in df_s1.columns else np.zeros(n, dtype=np.float32)
     F['x_oov_s23'] = g2('name_oov_frac').astype(np.float32) if 'name_oov_frac' in df_s23.columns else np.zeros(n, dtype=np.float32)
     # how many S1 entities of the country carry exactly the candidate's core name (chains vs unique names)
-    F['s23_core_s1_count'] = np.log1p(g2('s1_core_count').astype(np.float32)) if 's1_core_count' in df_s23.columns else np.zeros(n, dtype=np.float32)
+    F['s23_core_s1_count'] = np.minimum(g2('s1_core_count').astype(np.float32), 5.0) if 's1_core_count' in df_s23.columns else np.zeros(n, dtype=np.float32)
     has_alt = np.array([bool(a) for a in alt2])
     alt_sim = np.zeros(n, dtype=np.float32)
     if has_alt.any():
@@ -480,8 +480,10 @@ def compute_features(cand, df_s1, df_s23, vecs=None, extra_stats=None):
     legal_rel = np.where((lc1 > 0) & (lc2 > 0), np.where(lc1 == lc2, 2, 3), np.where((lc1 > 0) | (lc2 > 0), 1, 0))
     F['legal_rel'] = legal_rel.astype(np.int8)
     F['legal_code_s23'] = lc2
-    # how many S1 entities of the same country share this S1's core name (51% of S1 have a same-name twin)
-    F['s1_name_dup'] = np.log1p(g1('name_dup').astype(np.float32)) if 'name_dup' in df_s1.columns else np.zeros(n, dtype=np.float32)
+    # how many S1 entities of the same country share this S1's core name (51% of S1 have a same-name twin).
+    # Capped at 5: raw counts scale with the S1 pool (US test pool is half the train pool), the capped
+    # value ('unique / twin / small chain / big chain') does not.
+    F['s1_name_dup'] = np.minimum(g1('name_dup').astype(np.float32), 5.0) if 'name_dup' in df_s1.columns else np.zeros(n, dtype=np.float32)
 
     # ---------------- FLAGS ----------------
     F['f_script_s23'] = g2('name_script').astype(np.int8)
@@ -557,6 +559,10 @@ def compute_features(cand, df_s1, df_s23, vecs=None, extra_stats=None):
 
 
 DROP_COLS = ['cand_count', 'g_n_first_eq', 'g_n_high_name', 'legal_code_s23']
+# ER_DROP_FEATURES=x_oov_s23,s23_core_s1_count  -> ablations without code changes (train and inference
+# both read it; the trained feature list is stored in model_config.json so inference stays consistent)
+import os as _os
+DROP_COLS += [c.strip() for c in _os.environ.get('ER_DROP_FEATURES', '').split(',') if c.strip()]
 DENSITY_SENSITIVE_COLS = DROP_COLS
 
 
@@ -590,6 +596,8 @@ _PAR = {}
 
 def _par_init(df_s1, df_s23, vecs, extra_stats):
     global _PAR, WORKERS
+    import gc
+    gc.disable()         # children allocate only short-lived per-pair objects; no collections over the inherited heap
     _PAR = {'s1': df_s1, 's23': df_s23, 'vecs': vecs, 'stats': extra_stats}
     WORKERS = 1          # rapidfuzz threads: one per process, the pool provides the parallelism
 
@@ -622,8 +630,14 @@ def compute_features_parallel(cand, df_s1, df_s23, vecs=None, extra_stats=None, 
     cuts = sorted(set(cuts))
     parts = [cand_sorted.iloc[a:b] for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
     ctx = mp.get_context('fork')
-    with ctx.Pool(len(parts), initializer=_par_init, initargs=(df_s1, df_s23, vecs, extra_stats)) as pool:
-        feats = pool.map(_par_work, parts)
+    import gc
+    gc.collect()
+    gc.freeze()          # inherited objects go to the permanent generation: children never traverse (and dirty) them
+    try:
+        with ctx.Pool(len(parts), initializer=_par_init, initargs=(df_s1, df_s23, vecs, extra_stats)) as pool:
+            feats = pool.map(_par_work, parts)
+    finally:
+        gc.unfreeze()
     feat = pd.concat(feats, ignore_index=True)
     inv = np.empty_like(order)
     inv[order] = np.arange(n)

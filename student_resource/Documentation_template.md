@@ -75,9 +75,13 @@ entity retrieves its top-k neighbours with sparse matrix products (`sparse_dot_t
 Tokens occurring in more than 3 % of the country's S2/S3 rows are dropped; cosine < 0.08 is never a
 candidate. A **reverse channel** additionally lets every S2/S3 record retrieve its top-5 S1 entities on
 the joint vector: the S1's rank in that list is a "competition" feature (is this S1 the record's best
-owner?) and each record's top-1 S1 is added as an extra candidate. The union is capped at 80
-candidates per S1 entity by (best channel rank, summed score); recall@80 equals recall@150 on the
-held-out split. Every candidate keeps its score and rank in every channel as model features.
+owner?) and each record's top-1 S1 is added as an extra candidate. The union is capped at 100
+candidates per S1 entity by (best channel rank, summed score); on a 40k-entity held-out sample the
+true-pair recall by fused rank is 99.75 % @80, 99.80 % @100 and 99.84 % @150 (US) and 99.55 / 99.65 /
+99.75 % (India), and none of six alternative fused orderings (joint score, summed scores,
+reverse-aware sums) beat it. The residual tail is empty-address records with garbled names and
+Indic names with truncated addresses. Every candidate keeps its score and rank in every channel as
+model features.
 
 - **Candidate pairs generated:** [total, from inference log]
 - **Recall on a held-out training split:** [from train log, per country]
@@ -140,14 +144,22 @@ generator's singleton share (5.59%, identical in US and India) — a label-free 
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** [validation, from train log] (per country: [..])
+- **F_0.5 Score (macro):** [validation, from the SageMaker train log — replace] (per country: [..]).
+  Interim numbers from a 40k-entity local sample with only 20k training entities: 0.9874 plain /
+  0.9854 density-adjusted (US 0.9895 / 0.9878, India 0.9841 / 0.9817); blocking recall 99.8 % (US)
+  and 99.5 % (India) at the candidate cap.
 - **Public leaderboard:** [..]
-- **Common false positives (wrong merges):** same-street distractors whose house number differs
-  only by a digit substitution pattern that also occurs in true matches; same-name records at a
-  different address when the S2/S3 address is empty.
-- **Common false negatives (missed matches):** true matches whose house number was replaced by an
-  unrelated number (1.3 % of true pairs) together with a heavily altered name; domain-collapsed
-  names with an empty address.
+- **Error decomposition (same run, 5,000 validation entities, 63 entity-equivalents lost):** 61 % of
+  the loss is missed matches (387 entities with a false negative only), 30 % false positives
+  (84 entities), 6 % singletons wrongly matched (4 entities), 3 % both. 87 % of false-positive pairs
+  land on unmatched distractor rows.
+- **Common false positives (wrong merges):** same-street distractors with a one-letter acronym edit
+  (`YE Agro`→`YM Agro`) or a shifted secondary number and an otherwise identical address; exact-name
+  records with an empty address that belong to a same-name chain elsewhere.
+- **Common false negatives (missed matches):** 56 % of missed pairs are empty-address candidates whose
+  name was altered (typo, appended legal form, inserted word) — inherently ambiguous against
+  same-name chains; random generated names (`Iriquo`, `Belonovivio`) whose address was also degraded;
+  true pairs whose secondary number (floor, unit) was changed.
 
 ---
 

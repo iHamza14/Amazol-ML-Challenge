@@ -49,12 +49,21 @@ _DOTTED_RE = re.compile(r'(?<![a-z0-9])((?:[a-z]\.\s?){1,}[a-z])\b\.?')
 _DBA_RE = re.compile(
     r'^(.*?)\b(?:d\s?/\s?b\s?/\s?a|dba|doing business as|formerly known as|formerly|'
     r'f\s?/\s?k\s?/\s?a|fka|t\s?/\s?a|trading as|now known as|nka|a\s?/\s?k\s?/\s?a)\b\s*:?\s*(.+)$')
-_DOMAIN_RE = re.compile(r'^[\W_]*([a-z0-9][a-z0-9\-\.]*?)\.?(?:com|in|fr|net|org|co|io|biz|info|us|uk|eu)$')
+# a domain needs a literal '.tld'; the dot-less 'com' form ('sreetradecom') is accepted only for long tokens
+# that are not vocabulary words (otherwise 'Sirius' -> 'siri', 'Lotus' -> 'lot')
+_DOMAIN_RE = re.compile(r'^[\W_]*([a-z0-9][a-z0-9\-\.]*?)\.(?:com|in|fr|net|org|co|io|biz|info|us|uk|eu)$')
+_DOMAIN_NODOT_RE = re.compile(r'^[\W_]*([a-z0-9][a-z0-9\-]{5,}?)com$')
 _HANDLE_RE = re.compile(r'^[\s]*[@#]\s*([a-z0-9][a-z0-9_\-\.]*)$')
 _NONALNUM_RE = re.compile(r'[^a-z0-9\s]')
 _LEAD_JUNK_RE = re.compile(r'^[^a-z0-9]+')
 _TRAIL_NUM_RE = re.compile(r'(\s\d{4,})+$')
-_LEET_TOKEN_RE = re.compile(r'^(?=(?:.*[a-z]){3})(?=(?:.*\d){1,2})[a-z0-9]+$')
+# leet candidates: >=3 letters and exactly 1-2 digits ('cardi0logy', 'a1len'), never long digit runs
+_LEET_TOKEN_RE = re.compile(r'^(?=(?:[a-z]*\d){1,2}[a-z]*$)(?=(?:.*[a-z]){3})[a-z0-9]+$')
+_CP_CITY_RE = re.compile(r'^(\d{5})\s+([a-z].*)$')
+# short legal sigles that are also ordinary name tokens ('Sel Water', 'PC Club', 'Earl Grey', 'SA Apparels'):
+# removed only when they are NOT the first token, or when no other legal token exists in the name
+_AMBIGUOUS_LEGAL = frozenset({'sa', 'sas', 'sci', 'scs', 'sca', 'sel', 'sem', 'gie', 'earl', 'pc', 'pa', 'ei',
+                              'lp', 'snc', 'scm', 'scp', 'sccv', 'prop', 'co'})
 _ORD_SUFFIX_RE = re.compile(r'\b(\d+)(?:st|nd|rd|th|er|ere|eme|e)\b')
 _NUM_RE = re.compile(r'\d+')
 _HYPHEN_NUM_RE = re.compile(r'\b(\d+)\s*[-/]\s*(\d+)\b')
@@ -145,11 +154,12 @@ def _admin_lookup(component_norm, country):
 class SegVocab:
     """Unigram vocabulary built from S1 business names (provided data only)."""
 
-    def __init__(self, logp, maxlen=18, unk_per_char=-9.0):
+    def __init__(self, logp, maxlen=18, unk_per_char=-7.0):
         self.logp = logp
         self.maxlen = maxlen
         self.unk = unk_per_char
-        self.words = frozenset(logp.keys())
+        # single letters are never vocabulary words for the OOV / leet guards
+        self.words = frozenset(w for w in logp.keys() if len(w) >= 2)
 
     @classmethod
     def build(cls, names, min_count=2):
@@ -161,9 +171,10 @@ class SegVocab:
                     cnt[t] = cnt.get(t, 0) + 1
         tot = float(sum(cnt.values())) or 1.0
         logp = {w: math.log(c / tot) for w, c in cnt.items() if c >= min_count}
-        # allow common single letters as words with a penalty
+        # single letters as words only at a cost clearly above the unknown-run cost, so an unknown chunk
+        # stays one token instead of dissolving into letters ('iriecto' must not become 'i r i e c t o')
         for w in ('a', 'i', 'k', 'b', 'j', 'm', 'r', 's', 'n', 'u', 'q', 'h'):
-            logp.setdefault(w, math.log(1.0 / tot) - 4.0)
+            logp.setdefault(w, math.log(1.0 / tot) - 8.0)
         log.info(f"Segmentation vocabulary: {len(logp):,} words")
         return cls(logp)
 
@@ -254,18 +265,27 @@ def normalize_name(raw):
     collapsed_seed = None
     s_nospace = s.replace(' ', '')
     m = _DOMAIN_RE.match(s_nospace)
-    if m and ' ' not in s.strip() or (m and s_nospace.endswith(('.com', '.in', '.fr', '.net', '.org'))):
+    if m and (' ' not in s.strip() or s_nospace.endswith(('.com', '.in', '.fr', '.net', '.org'))):
         is_domain = 1
         collapsed_seed = m.group(1).replace('-', '').replace('.', '')
     else:
-        m2 = _HANDLE_RE.match(s)
-        if m2:
+        m_nd = _DOMAIN_NODOT_RE.match(s_nospace) if ' ' not in s.strip() else None
+        if m_nd and (_SEG is None or s_nospace.strip('*.-#@! ') not in _SEG.words):
             is_domain = 1
-            collapsed_seed = m2.group(1).replace('-', '').replace('.', '').replace('_', '')
+            collapsed_seed = m_nd.group(1).replace('-', '')
+        else:
+            m2 = _HANDLE_RE.match(s)
+            if m2:
+                is_domain = 1
+                collapsed_seed = m2.group(1).replace('-', '').replace('.', '').replace('_', '')
     if collapsed_seed is not None:
-        collapsed_seed = ''.join(T.LEET_MAP.get(c, c) if c.isdigit() else c for c in collapsed_seed) \
-            if _LEET_TOKEN_RE.match(collapsed_seed) else collapsed_seed
-        s = _SEG.segment(collapsed_seed) if _SEG is not None else collapsed_seed
+        if _SEG is not None:
+            # segment first, then repair leetspeak per token (keeps genuine digit runs such as '4528')
+            seg_toks = _SEG.segment(collapsed_seed).split()
+            s = ' '.join(_deleet_token(t) for t in seg_toks)
+            collapsed_seed = s.replace(' ', '')
+        else:
+            s = collapsed_seed
 
     # symbols and punctuation; French elisions (l'atelier -> l atelier) before apostrophes are dropped,
     # English possessives (celestyna's) stay glued
@@ -290,12 +310,18 @@ def normalize_name(raw):
         s = _LEGAL_ABBREV_RE.sub(lambda m: T.LEGAL_SUFFIX_ABBREV.get(m.group(0), m.group(0)), s)
         s = _WS_RE.sub(' ', s).strip()
     toks = s.split()
-    legal_code = 0
-    for t in toks:
+    legal_hits = [t for t in toks if t in _LEGAL_TOKENS]
+    fams = [_LEGAL_FAMILY[t] for t in toks if t in _LEGAL_FAMILY]
+    legal_code = fams[0] if fams else (12 if legal_hits else 0)
+    # remove legal forms anywhere in the name ('Private Team Nirman Ltd'), but keep an ambiguous sigle in
+    # first position when another legal token exists ('PC Club SAS' -> 'pc club', 'Sel Water Pvt Ltd' -> 'sel water')
+    core_toks = []
+    for i, t in enumerate(toks):
         if t in _LEGAL_TOKENS:
-            legal_code = _LEGAL_FAMILY.get(t, 12)
-            break
-    core_toks = [t for t in toks if t not in _LEGAL_TOKENS]
+            if i == 0 and t in _AMBIGUOUS_LEGAL and len(legal_hits) >= 2:
+                core_toks.append(t)
+            continue
+        core_toks.append(t)
     while core_toks and core_toks[-1] == 'and':
         core_toks.pop()
     while core_toks and core_toks[0] == 'and':
@@ -365,9 +391,12 @@ def normalize_address(raw, country):
         cn = _norm_component(c)
         if not cn:
             continue
-        adm = _admin_lookup(cn, country)
-        if adm is None and not cn.isascii():
-            adm = _admin_lookup(unidecode(cn).lower().strip(), country)
+        # admin lookup on a hyphen-free key ('hauts-de-france' -> 'hauts de france'); the component itself
+        # keeps its hyphens so hyphenated numbers are still parsed below
+        key = _WS_RE.sub(' ', cn.replace('-', ' ')).strip()
+        adm = _admin_lookup(key, country)
+        if adm is None and not key.isascii():
+            adm = _admin_lookup(unidecode(key).lower().strip(), country)
         if adm is not None:
             admin = adm
             kept.append(adm)
@@ -375,6 +404,12 @@ def normalize_address(raw, country):
         if _POSTAL_RE.match(cn):
             postal = cn
             kept.append(cn)
+            continue
+        # French 'CP CITY' inside one component ('59000 LILLE'): the code is a postal code, not a house number
+        m_cp = _CP_CITY_RE.match(cn)
+        if m_cp and country == 'france':
+            postal = m_cp.group(1)
+            kept.append(m_cp.group(2))
             continue
         kept.append(cn)
     s = ' , '.join(kept)
@@ -410,8 +445,14 @@ def normalize_address(raw, country):
         elif t.isdigit():
             t = t.lstrip('0') or '0'
         t = T.ADDR_ABBREV.get(t, t)
-        t = T.CITY_ALIASES.get(t, t)
-        toks.append(t)
+        # single-token city aliases only for keys of >=4 chars ('jp' must stay 'jp' in 'JP Nagar');
+        # multi-word canonical values are split back into tokens
+        if len(t) >= 4:
+            t = T.CITY_ALIASES.get(t, t)
+        if ' ' in t:
+            toks.extend(t.split())
+        else:
+            toks.append(t)
     nums = []
     words = []
     street_toks = []

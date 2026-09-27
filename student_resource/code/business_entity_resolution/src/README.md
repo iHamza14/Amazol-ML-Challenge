@@ -23,7 +23,7 @@ python inference.py                         # ~1 h: writes ../../../output/match
 
 Useful environment variables: `ER_N_JOBS` (worker processes, default all cores), `ER_SAMPLE_S1`
 (number of S1 entities used for training pairs; default 400000; e.g. 100000 for a 30-40 min run),
-`ER_MAX_CANDIDATES` (candidate cap per S1, default 80, identical for train and inference),
+`ER_MAX_CANDIDATES` (candidate cap per S1, default 100, identical for train and inference),
 `ER_NO_CATBOOST=1` (LightGBM only), `ER_FRANCE_FILTER=1` (enable the street-support filter for unseen
 countries; off by default because it hurt seen countries on validation), `ER_CACHE_S23=1` (keep the
 preprocessed S2/S3 frames of all countries in memory between passes — needs ~64 GB on the full data).

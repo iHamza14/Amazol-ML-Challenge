@@ -35,7 +35,7 @@ from france_filter import apply_france_filter
 
 log = logging.getLogger('inference')
 
-KEEP_PROB = 0.02
+KEEP_PROB = cfg.DECISION_KEEP_PROB
 
 
 def load_models(model_dir):
@@ -125,7 +125,27 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
     s1_ids = df_s1['entity_id'].values
     s1_country = df_s1['country_norm'].values
     n_s1 = len(df_s1)
-    seen_countries = set(dec.get('thresholds', {}).keys())
+    # countries the models were trained/validated on (persisted by train.py; the threshold keys can be empty
+    # when the expected-F0.5 mode with floor 0 wins, so they must not be used for this)
+    seen_countries = set(mcfg.get('seen_countries') or [k.split('|')[0] for k in dec.get('thresholds', {})]
+                         or list(mcfg.get('val_per_country', {}).keys()))
+    # blocking settings must match training: candidate cap, reverse channel and top-k define fused_rank,
+    # rev_* and the group-relative features the models were trained on
+    blk = mcfg.get('blocking')
+    if blk:
+        eff_cap = max_candidates or cfg.BLOCK_MAX_CANDIDATES
+        if eff_cap != blk['max_candidates'] or bool(cfg.USE_REVERSE_BLOCKING) != bool(blk['use_reverse']) \
+                or cfg.REVERSE_TOPK != blk.get('reverse_topk', cfg.REVERSE_TOPK) or dict(cfg.BLOCK_TOPK) != dict(blk.get('topk', cfg.BLOCK_TOPK)):
+            log.warning(f"  BLOCKING SETTINGS DIFFER FROM TRAINING: now cap={eff_cap} reverse={cfg.USE_REVERSE_BLOCKING} "
+                        f"topk={dict(cfg.BLOCK_TOPK)} vs trained {blk}. Using the TRAINED settings.")
+            max_candidates = int(blk['max_candidates'])
+            cfg.USE_REVERSE_BLOCKING = bool(blk['use_reverse'])
+            cfg.REVERSE_TOPK = int(blk.get('reverse_topk', cfg.REVERSE_TOPK))
+            cfg.BLOCK_TOPK = dict(blk.get('topk', cfg.BLOCK_TOPK))
+    keep_prob_trained = float(mcfg.get('keep_prob', KEEP_PROB))
+    if abs(keep_prob_trained - KEEP_PROB) > 1e-9:
+        log.warning(f"  keep_prob differs from training ({keep_prob_trained} vs {KEEP_PROB}); using the trained value")
+    keep_prob = keep_prob_trained
     for c in pd.unique(s1_country):
         if c not in seen_countries:
             dec.setdefault('thresholds', {})[c] = float(unseen_t)
@@ -165,7 +185,7 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
             X = feat[feat_cols].values.astype(np.float32)
             pm = predict_models(models, X)
             p_max = np.max(np.stack(list(pm.values())), axis=0) if pm else np.zeros(len(X), dtype=np.float32)
-            keep = p_max >= KEEP_PROB
+            keep = p_max >= keep_prob
             pred_s1.append(s1p[keep])
             pred_s23.append(s23_ids_c[s23p[keep]])
             pred_p.append(p_max[keep])
@@ -287,13 +307,18 @@ def run_inference(test_dir=None, output_dir=None, model_dir=None, threshold_shif
                  f"max_links={int(n_links_arr[m].max()) if m.any() else 0}{flag}")
     log.info(f"  -> {match_path}\n  -> {cand_path}")
 
+    # free the big in-memory structures before the validator subprocess (its candidate cross-check alone
+    # needs ~12 KB per S1 entity, ~20 GB on the full test set); the subset property was enforced above, so the
+    # validator is run on the matching file only. Re-run it with --candidate from a fresh shell if desired.
+    del df_s1, cand_lists, cand_out, match_lists, P_s1, P_s23, P_models, P_p, P_group, P_st, P_rel, P_noaddr, s23_code, mask
+    gc.collect()
     validator = os.path.join(cfg.PROJECT_ROOT, 'utils', 'validate_submission.py')
     if not os.path.exists(validator):
         validator = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'utils', 'validate_submission.py'))
     if os.path.exists(validator):
-        log.info("STEP 6: running official validator")
+        log.info("STEP 6: running official validator (matching file; candidate file checked separately to save memory)")
         try:
-            out = subprocess.run([sys.executable, validator, '--matching', match_path, '--candidate', cand_path,
+            out = subprocess.run([sys.executable, validator, '--matching', match_path,
                                   '--test-dir', test_dir], capture_output=True, text=True, timeout=1800)
             log.info(out.stdout[-3000:])
             if out.returncode != 0:

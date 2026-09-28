@@ -1,10 +1,14 @@
-pandas
-numpy
-scikit-learn
-xgboost
-rapidfuzz
-sentence-transformers
-faiss-cpu
-rank_bm25
-tqdm
-torch
+pandas>=2.0,<3
+numpy>=1.24,<3
+scipy>=1.10
+scikit-learn>=1.3
+lightgbm>=4.0
+catboost>=1.2
+rapidfuzz>=3.8
+unidecode>=1.3
+sparse_dot_topn>=1.1
+pyarrow>=14.0
+tqdm>=4.65
+# Optional (Phase 2 cross-encoder, GPU only)
+# torch>=2.0
+# sentence-transformers>=2.2

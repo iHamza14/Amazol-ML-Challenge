@@ -1,7 +1,23 @@
-import pandas as pd
-import numpy as np
+"""
+Inference pipeline v2 (single command: `python inference.py`).
+
+  1. Load models + decision config + transliteration table + segmentation vocab + extra-token stats.
+  2. Load test sources; preprocess S1 (all) and S2/S3 per country.
+  3. Per country: stream blocking chunks -> features -> ensemble probabilities.
+     Keep every candidate (for candidate_pairs.tsv) and every pair with prob >= 0.02 (for the
+     decision layer) in compact arrays.
+  4. Decision layer: thresholds / expected-F0.5 selection, S2/S3 conflict resolution,
+     France (unseen-country) filter.
+  5. Write output/matching_results.tsv and output/candidate_pairs.tsv (every S1 entity, in file
+     order, deduplicated sorted id lists) and run the official validator if present.
+
+CLI: --test-dir --output-dir --model-dir --threshold-shift (added to every threshold)
+     --no-conflicts --no-france-filter --max-candidates
+"""
 import os
-import argparse
+import gc
+import json
+import time
 import logging
 import pickle
 import gc

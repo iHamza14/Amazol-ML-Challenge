@@ -1,11 +1,43 @@
-import pandas as pd
+"""
+Blocking v2 — multi-channel sparse TF-IDF top-k retrieval (per country, chunked) + reverse channel.
+
+Why this design
+  * Python dict-of-sets inverted indexes (v1) need >100 GB for 12M records and hours of
+    Python loops.  Sparse matrix products with `sparse_dot_topn` retrieve the top-k for
+    20k S1 rows against 5M S2/S3 rows in seconds, multi-threaded, in a few hundred MB.
+  * Recall analysis on the training data: 14.6% of true pairs share NO name token and
+    4.5% share NO address token, but only 0.02% share neither.  Hence several channels
+    are unioned; every candidate keeps the score and rank it obtained in every channel
+    (these become model features).
+  * Reverse channel: each S2/S3 record retrieves ITS top-k S1 entities (joint vector). The
+    rank of the S1 in the record's list ("is this S1 the best owner of this record?") is a
+    competition feature that the best public pipelines report as their strongest signal,
+    and the record's top-1 S1 is added as an extra candidate (recall pass).
+
+Forward channels
+  name_tok : IDF-weighted word unigrams of the core business name
+  name_chr : char 3-grams of the space-less core name (typos, leetspeak, collapsed domains)
+  addr_tok : address words + numbers
+  addr_num : (number, street-word) combinations — very precise address signal
+  joint    : name + address tokens in one vector — best overall ranking
+
+Output per chunk: DataFrame with s1_pos, s23_pos (row positions in the full preprocessed
+frames), per-channel score/rank, n_channels, min_rank, sum_score, fused_rank, cand_count,
+rev_rank, rev_score.
+"""
+import math
+import logging
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 import logging
 from tqdm import tqdm
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ------------------------------------------------------------------
+# Document builders for each channel
+# ------------------------------------------------------------------
+_GRAM_CACHE = {}
 
 def get_sparse_top_k(X_s1, X_s23, top_k=15, threshold=0.3, batch_size=1000):
     """

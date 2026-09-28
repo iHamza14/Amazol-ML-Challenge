@@ -1,4 +1,31 @@
-import pandas as pd
+"""
+Feature engineering v2 — vectorised pair features for candidate chunks.
+
+Groups
+  NAME   fuzzy similarities on several normalised variants (core / strict / with-suffix /
+         collapsed / alt-name), TF-IDF cosines (word + char 3-gram), token overlap,
+         rare-shared-token IDF, extra-token statistics learned from training pairs
+         (words the distractor generator inserts: 'holdings', 'midtown', ... have ~0%
+         true-match rate; words the noise generator inserts: 'center', 'services', 'dr'
+         have ~95%).
+  ADDR   fuzzy similarities on full address and street string, TF-IDF cosine, word overlap,
+         admin (state/region) agreement, postal code agreement, component counts.
+  NUMBERS the decisive signal for near-miss distractors: first-number relation
+         (equal / truncation prefix / truncation suffix / digit substitution / disjoint),
+         absolute difference, digit hamming, shared-number counts, range containment,
+         digit-string containment ('1-02' vs '102').
+  FLAGS  script of the S2/S3 name, domain-collapsed, dba, empty address, source (S2/S3).
+  BLOCK  per-channel retrieval scores and ranks, number of channels, candidate count.
+  GROUP  relative features within the S1 entity's candidate set: gap to the best
+         candidate on name / address / street / retrieval score, rank by combined
+         similarity, number of candidates whose house number equals S1's.
+
+All functions operate on a candidate chunk DataFrame (s1_pos, s23_pos, block meta) plus
+the two preprocessed frames; strings are pulled by position from numpy arrays.
+"""
+import json
+import logging
+import threading
 import numpy as np
 from rapidfuzz import fuzz, distance
 

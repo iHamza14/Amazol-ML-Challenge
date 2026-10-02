@@ -1,6 +1,6 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** Orcya  
+**Team Name:** ORCA  
 **Team Members:** Hamza Anwar (lead), Harsh Dahiya, Afzal, Shahan Ayyubi  
 **Submission Date:** 27 September 2026
 
